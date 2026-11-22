@@ -102,6 +102,26 @@ def _public_link_up() -> bool:
     return Path(f"/sys/class/net/{PUBLIC_BRIDGE}/bridge").exists()
 
 
+SSH_KEY_RE = re.compile(
+    r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
+    r" [A-Za-z0-9+/]{40,4096}={0,3}( [^\x00-\x1f]{0,200})?$")
+
+
+def clean_ssh_keys(keys) -> list[str]:
+    """Validate OpenSSH public key lines; refuse private keys and anything with options or newlines."""
+    if not isinstance(keys, list) or not 1 <= len(keys) <= 20:
+        raise AgentError(400, "keys must be a list of 1-20 public keys")
+    out = []
+    for k in keys:
+        k = str(k).strip()
+        if "PRIVATE KEY" in k:
+            raise AgentError(400, "that is a PRIVATE key: never share it. Paste the public key (ssh-ed25519 / ecdsa-... / ssh-rsa ...)")
+        if not SSH_KEY_RE.match(k):
+            raise AgentError(400, "not a valid OpenSSH public key line: " + k[:40])
+        out.append(k)
+    return out
+
+
 class LibvirtBackend:
     def __init__(self):
         import libvirt  # system package python3-libvirt (venv uses --system-site-packages)
@@ -376,6 +396,43 @@ class LibvirtBackend:
                     "public_ip": spec.get("public_ip"), "internal_ip": internal_ip})
         return out
 
+    def _guest_dom(self, vm_id: str):
+        self._ensure_conn()
+        d = self._dom(vm_id)
+        if not d.isActive():
+            raise AgentError(409, "start the VM first: SSH keys are set through the guest agent inside the running VM")
+        return d
+
+    def _ga_error(self, e) -> AgentError:
+        msg = str(e)
+        if "not connected" in msg or "not responding" in msg or "agent" in msg.lower():
+            return AgentError(409, "the VM's guest agent isn't answering yet (still booting?). Try again in a minute")
+        return AgentError(500, msg)
+
+    def ssh_keys_get(self, vm_id: str) -> dict:
+        d = self._guest_dom(vm_id)
+        try:
+            keys = d.authorizedSSHKeysGet(DEFAULT_USER, 0)
+        except self.libvirt.libvirtError as e:
+            raise self._ga_error(e)
+        return {"user": DEFAULT_USER, "keys": [k for k in keys if k.strip()]}
+
+    def ssh_keys_add(self, vm_id: str, keys: list[str]) -> dict:
+        d = self._guest_dom(vm_id)
+        try:
+            d.authorizedSSHKeysSet(DEFAULT_USER, keys, self.libvirt.VIR_DOMAIN_AUTHORIZED_SSH_KEYS_SET_APPEND)
+        except self.libvirt.libvirtError as e:
+            raise self._ga_error(e)
+        return self.ssh_keys_get(vm_id)
+
+    def ssh_keys_remove(self, vm_id: str, keys: list[str]) -> dict:
+        d = self._guest_dom(vm_id)
+        try:
+            d.authorizedSSHKeysSet(DEFAULT_USER, keys, self.libvirt.VIR_DOMAIN_AUTHORIZED_SSH_KEYS_SET_REMOVE)
+        except self.libvirt.libvirtError as e:
+            raise self._ga_error(e)
+        return self.ssh_keys_get(vm_id)
+
     def action(self, vm_id: str, action: str) -> dict:
         self._ensure_conn()
         d = self._dom(vm_id)
@@ -562,6 +619,25 @@ class FakeBackend:
         self.vms[vm_id]["state"] = {"start": "running", "shutdown": "stopped", "poweroff": "stopped",
                                     "reboot": "running"}[action]
         return self.vms[vm_id]
+
+    def _fake_keys(self, vm_id):
+        v = self.get(vm_id)
+        if v["state"] != "running":
+            raise AgentError(409, "start the VM first: SSH keys are set through the guest agent inside the running VM")
+        return self.vms[vm_id].setdefault("ssh_keys", [])
+
+    def ssh_keys_get(self, vm_id):
+        return {"user": DEFAULT_USER, "keys": list(self._fake_keys(vm_id))}
+
+    def ssh_keys_add(self, vm_id, keys):
+        cur = self._fake_keys(vm_id)
+        cur.extend(k for k in keys if k not in cur)
+        return self.ssh_keys_get(vm_id)
+
+    def ssh_keys_remove(self, vm_id, keys):
+        cur = self._fake_keys(vm_id)
+        cur[:] = [k for k in cur if k not in keys]
+        return self.ssh_keys_get(vm_id)
 
     def delete(self, vm_id):
         self.get(vm_id)
@@ -1084,6 +1160,20 @@ async def vm_action(request: Request):
 
 
 @endpoint
+async def ssh_keys_get(request):
+    return await asyncio.to_thread(backend.ssh_keys_get, vm_id_of(request))
+
+
+@endpoint
+async def ssh_keys_change(request):
+    vm_id = vm_id_of(request)
+    body = await request.json()
+    keys = clean_ssh_keys(body.get("keys"))
+    fn = backend.ssh_keys_remove if request.method == "DELETE" else backend.ssh_keys_add
+    return await asyncio.to_thread(fn, vm_id, keys)
+
+
+@endpoint
 async def delete_vm(request):
     vm_id = vm_id_of(request)
     async with lock:
@@ -1182,6 +1272,8 @@ app = Starlette(routes=[
     Route("/backups/{bid}/restore", backup_restore, methods=["POST"]),
     Route("/backups/{bid}/restore-new", backup_restore_new, methods=["POST"]),
     Route("/vms/{vm_id}/backups", backup_create, methods=["POST"]),
+    Route("/vms/{vm_id}/ssh-keys", ssh_keys_get, methods=["GET"]),
+    Route("/vms/{vm_id}/ssh-keys", ssh_keys_change, methods=["POST", "DELETE"]),
     Route("/vms/{vm_id}/{action}", vm_action, methods=["POST"]),
     WebSocketRoute("/vms/{vm_id}/console", console),
     WebSocketRoute("/events", events),

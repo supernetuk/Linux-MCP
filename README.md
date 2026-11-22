@@ -108,6 +108,8 @@ sudo bash /opt/Linux-MCP/node-agent/install.sh
 | `POST /backups/{bk}/finish` | Job: check the image (formats qcow2, raw, vmdk, vhdx, vhd, vdi; images with backing files or external data are refused), convert to qcow2 |
 | `DELETE /backups/{bk}` | Delete a backup |
 | `POST /vms/{id}/start\|shutdown\|reboot\|poweroff` | Power actions |
+| `GET /vms/{id}/ssh-keys` | SSH public keys of the VM's login user (read through the QEMU guest agent; VM must be running) |
+| `POST` / `DELETE /vms/{id}/ssh-keys` | Add / remove keys `{keys: ["ssh-ed25519 AAAA… comment"]}`. Only plain OpenSSH public key lines are accepted (no options, no private keys). Works on running VMs without a reboot |
 | `DELETE /vms/{id}` | Destroy, undefine and delete its disks and seed ISO (only `vm-…` names) |
 | `WS /vms/{id}/console` | VNC bridge for noVNC |
 | `WS /events` | Live stream of capacity and VM states every 3 s |
