@@ -101,8 +101,11 @@ sudo bash /opt/Linux-MCP/node-agent/install.sh
 | `GET /backups`, `GET /backups/{bk}` | Backups with status, progress, size, SHA-256; free space in `BACKUP_DIR` |
 | `POST /vms/{id}/backups` | Start a backup `{note?}`. Running VMs: live copy (libvirt backup-begin, file systems frozen through the guest agent when available). Stopped VMs: `qemu-img convert` |
 | `GET /backups/{bk}/download` | The qcow2 image (supports `Range`, so downloads can resume) |
-| `POST /backups/{bk}/restore` | Job: shut the VM down, replace its disk with the backup, start it |
+| `POST /backups/{bk}/restore` | Job: shut the VM down, replace its disk with the backup, start it. `{vm_id}` restores onto another VM |
 | `POST /backups/{bk}/restore-new` | Job: create a new VM from the backup (same body as `POST /vms`, new hostname and login) |
+| `POST /backups/upload` | Start an image upload `{filename, size, note?}` |
+| `PUT /backups/{bk}/chunk?offset=N` | Append up to 100 MB; a 409 reply says how many bytes the node already has, so uploads can resume |
+| `POST /backups/{bk}/finish` | Job: check the image (formats qcow2, raw, vmdk, vhdx, vhd, vdi; images with backing files or external data are refused), convert to qcow2 |
 | `DELETE /backups/{bk}` | Delete a backup |
 | `POST /vms/{id}/start\|shutdown\|reboot\|poweroff` | Power actions |
 | `DELETE /vms/{id}` | Destroy, undefine and delete its disks and seed ISO (only `vm-…` names) |

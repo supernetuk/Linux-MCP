@@ -726,7 +726,7 @@ class BackupMixin:
 
     def backup_delete(self, bid: str) -> dict:
         meta = read_meta(bid)
-        if meta.get("status") == "running":
+        if meta.get("status") in ("running", "processing"):
             raise AgentError(409, "backup still running")
         shutil.rmtree(_bk_dir(bid))
         return {"id": bid, "deleted": True}
@@ -737,15 +737,107 @@ class BackupMixin:
             raise AgentError(409, "backup is not ready")
         return _bk_dir(bid) / meta["file"], f"{meta['vm_id']}-{bid}.qcow2"
 
-    def restore_start(self, bid: str) -> dict:
+    def restore_start(self, bid: str, target: str | None = None) -> dict:
         meta = read_meta(bid)
         if meta.get("status") != "ready":
             raise AgentError(409, "backup is not ready")
-        self.get(meta["vm_id"])                  # must still exist here (else use restore-as-new)
-        mark_busy(meta["vm_id"])
-        job = new_job("restore", vm_id=meta["vm_id"], backup_id=bid)
-        run_job(job, self._do_restore, meta["vm_id"], bid)
+        vm_id = target or meta["vm_id"]
+        if not VM_ID.match(vm_id):
+            raise AgentError(400, "can only restore onto VMs named vm-…")
+        self.get(vm_id)                          # must exist here (else use restore-as-new)
+        mark_busy(vm_id)
+        job = new_job("restore", vm_id=vm_id, backup_id=bid)
+        run_job(job, self._do_restore, vm_id, bid)
         return job
+
+    # ---- uploads: an image from the admin's computer, sent in chunks (Cloudflare caps each request ~100 MB)
+    UPLOAD_MAX = 2 * 2**40              # 2 TiB
+    CHUNK_MAX = 100 * 2**20
+
+    def upload_start(self, filename: str, size: int, note: str = "") -> dict:
+        if not (0 < size <= self.UPLOAD_MAX):
+            raise AgentError(400, "bad file size")
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(BACKUP_DIR).free < size * 2.2 + 5 * 2**30:      # upload + converted copy
+            raise AgentError(507, f"not enough space in {BACKUP_DIR}")
+        bid = f"bk-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}-{secrets.token_hex(3)}"
+        d = _bk_dir(bid)
+        d.mkdir(mode=0o711)
+        (d / "upload.part").touch(mode=0o600)
+        name = re.sub(r"[^A-Za-z0-9._ -]", "_", filename)[:120] or "image"
+        meta = {"id": bid, "vm_id": "upload", "node": NODE_ID, "status": "uploading", "progress": 0, "kind": "upload",
+                "note": note[:200], "source_name": name, "expected_bytes": size, "received_bytes": 0,
+                "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "file": "disk.qcow2"}
+        write_meta(bid, meta)
+        return meta
+
+    def upload_chunk(self, bid: str, offset: int, data: bytes) -> dict:
+        meta = read_meta(bid)
+        if meta.get("status") != "uploading":
+            raise AgentError(409, "upload is not open")
+        part = _bk_dir(bid) / "upload.part"
+        have = part.stat().st_size
+        if offset != have:                       # lets the browser resume: it re-sends from `have`
+            raise AgentError(409, f"offset mismatch: have {have}")
+        if have + len(data) > meta["expected_bytes"]:
+            raise AgentError(400, "more data than the declared size")
+        with open(part, "ab") as f:
+            f.write(data)
+        meta["received_bytes"] = have + len(data)
+        meta["progress"] = round(100 * meta["received_bytes"] / meta["expected_bytes"], 1)
+        write_meta(bid, meta)
+        return {"id": bid, "received_bytes": meta["received_bytes"]}
+
+    def upload_finish(self, bid: str) -> dict:
+        meta = read_meta(bid)
+        part = _bk_dir(bid) / "upload.part"
+        if meta.get("status") != "uploading":
+            raise AgentError(409, "upload is not open")
+        if part.stat().st_size != meta["expected_bytes"]:
+            raise AgentError(409, f"incomplete: {part.stat().st_size} of {meta['expected_bytes']} bytes")
+        meta.update(status="processing", progress=0)
+        write_meta(bid, meta)
+        job = new_job("upload", backup_id=bid)
+        run_job(job, self._process_upload, bid)
+        return job
+
+    def _process_upload(self, bid: str) -> dict:
+        d = _bk_dir(bid)
+        part, out = d / "upload.part", d / "disk.qcow2"
+        try:
+            if FAKE:
+                os.replace(part, out)
+                vsize = 20 * 2**30
+            else:
+                # Inspect untrusted image. Refuse anything that points at other files on this host.
+                info = json.loads(run(["qemu-img", "info", "--output", "json", str(part)], timeout=120))
+                fmt = info.get("format")
+                if fmt not in {"qcow2", "raw", "vmdk", "vhdx", "vpc", "vdi"}:
+                    raise AgentError(400, f"unsupported image format: {fmt}")
+                spec = (info.get("format-specific") or {}).get("data") or {}
+                if info.get("backing-filename") or info.get("full-backing-filename") or spec.get("data-file") \
+                        or fmt == "vmdk" and (spec.get("extents") and any(e.get("filename") != str(part) for e in spec["extents"])):
+                    raise AgentError(400, "image refers to other files (backing file / external data) - not allowed")
+                vsize = int(info.get("virtual-size") or 0)
+                if not (2**30 <= vsize <= self.UPLOAD_MAX):
+                    raise AgentError(400, "image virtual size must be between 1 GB and 2 TB")
+                run(["qemu-img", "convert", "-f", fmt, "-O", "qcow2", str(part), str(out)], timeout=14400)
+                part.unlink()
+                run(["qemu-img", "check", "-f", "qcow2", str(out)], timeout=3600)
+            meta = read_meta(bid)
+            meta.update(status="ready", progress=100, size_bytes=out.stat().st_size, sha256=sha256_file(out),
+                        finished=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        vm={"vcpu": 1, "ram_mb": 2048, "disk_gb": -(-vsize // 2**30)})
+            write_meta(bid, meta)
+            return {"backup_id": bid, "disk_gb": meta["vm"]["disk_gb"]}
+        except Exception as e:  # noqa: BLE001
+            msg = e.message if isinstance(e, AgentError) else f"{type(e).__name__}: {e}"
+            meta = read_meta(bid)
+            meta.update(status="failed", error=msg[:500])
+            write_meta(bid, meta)
+            part.unlink(missing_ok=True)
+            out.unlink(missing_ok=True)
+            raise
 
     def restore_new_start(self, bid: str, spec: dict) -> dict:
         meta = read_meta(bid)
@@ -923,7 +1015,35 @@ async def backup_delete(request):
 
 @endpoint
 async def backup_restore(request):
-    return public_job(await asyncio.to_thread(backend.restore_start, request.path_params["bid"]))
+    body = await request.json() if (await request.body()) else {}
+    target = body.get("vm_id") or None
+    return public_job(await asyncio.to_thread(backend.restore_start, request.path_params["bid"], target))
+
+
+@endpoint
+async def upload_start(request):
+    body = await request.json()
+    return await asyncio.to_thread(backend.upload_start, str(body.get("filename") or "image"),
+                                   int(body.get("size") or 0), str(body.get("note") or ""))
+
+
+@endpoint
+async def upload_chunk(request):
+    try:
+        offset = int(request.query_params.get("offset", "-1"))
+    except ValueError:
+        raise AgentError(400, "bad offset")
+    data = bytearray()
+    async for piece in request.stream():
+        data += piece
+        if len(data) > backend.CHUNK_MAX:
+            raise AgentError(413, "chunk too large")
+    return await asyncio.to_thread(backend.upload_chunk, request.path_params["bid"], offset, bytes(data))
+
+
+@endpoint
+async def upload_finish(request):
+    return public_job(await asyncio.to_thread(backend.upload_finish, request.path_params["bid"]))
 
 
 @endpoint
@@ -1053,7 +1173,10 @@ app = Starlette(routes=[
     Route("/vms/{vm_id}", delete_vm, methods=["DELETE"]),
     Route("/jobs/{job_id}", get_job, methods=["GET"]),
     Route("/backups", backups_list, methods=["GET"]),
+    Route("/backups/upload", upload_start, methods=["POST"]),
     Route("/backups/{bid}", backup_meta, methods=["GET"]),
+    Route("/backups/{bid}/chunk", upload_chunk, methods=["PUT"]),
+    Route("/backups/{bid}/finish", upload_finish, methods=["POST"]),
     Route("/backups/{bid}", backup_delete, methods=["DELETE"]),
     Route("/backups/{bid}/download", backup_download, methods=["GET", "HEAD"]),
     Route("/backups/{bid}/restore", backup_restore, methods=["POST"]),
