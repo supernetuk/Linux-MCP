@@ -96,7 +96,14 @@ sudo bash /opt/Linux-MCP/node-agent/install.sh
 | `GET /capacity` | CPUs, RAM, VM disk space, vCPU/RAM allocated, VM counts |
 | `GET /templates` | OS images in `TEMPLATE_DIR` (`*.qcow2`) |
 | `GET /vms`, `GET /vms/{id}` | VM list; detail with disks, IPs and VNC port |
-| `POST /vms` | Create `{id, hostname, template, vcpu, ram_mb, disk_gb, ssh_keys[], public_ip?}`. Returns the generated login password once |
+| `POST /vms` | Create `{id, hostname, template, vcpu, ram_mb, disk_gb, ssh_keys[], public_ip?, async?}`. Returns the generated login password once. With `"async": true` it returns a job at once and builds in the background |
+| `GET /jobs/{id}[?consume=1]` | Background job status (`running`/`done`/`failed`) and result. `consume=1` hands out a new VM's password once, then removes it |
+| `GET /backups`, `GET /backups/{bk}` | Backups with status, progress, size, SHA-256; free space in `BACKUP_DIR` |
+| `POST /vms/{id}/backups` | Start a backup `{note?}`. Running VMs: live copy (libvirt backup-begin, file systems frozen through the guest agent when available). Stopped VMs: `qemu-img convert` |
+| `GET /backups/{bk}/download` | The qcow2 image (supports `Range`, so downloads can resume) |
+| `POST /backups/{bk}/restore` | Job: shut the VM down, replace its disk with the backup, start it |
+| `POST /backups/{bk}/restore-new` | Job: create a new VM from the backup (same body as `POST /vms`, new hostname and login) |
+| `DELETE /backups/{bk}` | Delete a backup |
 | `POST /vms/{id}/start\|shutdown\|reboot\|poweroff` | Power actions |
 | `DELETE /vms/{id}` | Destroy, undefine and delete its disks and seed ISO (only `vm-…` names) |
 | `WS /vms/{id}/console` | VNC bridge for noVNC |
@@ -123,6 +130,8 @@ sudo bash /opt/Linux-MCP/node-agent/install.sh
 | `PUBLIC_PREFIX` | `27` | Prefix length |
 | `PUBLIC_DNS` | `1.1.1.1,8.8.8.8` | Resolvers written into the VM |
 | `PUBLIC_POOL` | `203.0.113.2,203.0.113.3,…` | The only addresses the agent will assign |
+
+Backups are stored in `BACKUP_DIR` (the installer sets `/home/vm-backups`; change it in `config.env` to put backups on your largest disk), one folder per backup with `disk.qcow2`, `domain.xml` and `meta.json`. The installer creates it with the SELinux `virt_image_t` label. Jobs live in memory: if the agent restarts during a job, that job is reported as failed.
 
 Example bridge on a spare NIC (doesn't touch the host's own connection):
 
