@@ -10,6 +10,29 @@ Two small, independent services for an AlmaLinux 9/10 KVM host:
 Both listen on localhost only. Expose them through an outbound tunnel (for example Cloudflare Tunnel), protected by an
 access layer such as Cloudflare Access, and never through an open port.
 
+## Quick start: set up a new KVM node with one command
+
+```bash
+git clone https://github.com/<you>/Linux-MCP.git /opt/Linux-MCP
+sudo bash /opt/Linux-MCP/setup-node.sh --node-id node-2 \
+     --bridge-nic eth1 --public-gateway 203.0.113.1 --public-prefix 27 --public-range 203.0.113.2-30 \
+     --agent-host agent-2.example.com \
+     --mcp-host ops-2.example.com          # optional
+```
+
+1. Checks the OS (AlmaLinux / Rocky / RHEL 9 or 10) and CPU virtualisation.
+2. Installs KVM, libvirt, virt-install, guestfs-tools and xorriso, and starts libvirt and its NAT network.
+3. Downloads the AlmaLinux GenericCloud image as a template, with its checksum verified.
+4. Creates the VM bridge on a **spare** NIC (optional). It refuses a NIC that has the host's IP or default route.
+5. Installs the KVM node agent and writes the node ID and public network settings.
+6. Creates a Cloudflare Tunnel, or reuses the existing one, and routes the agent (and MCP) hostnames to it. The first
+   run asks you to open a Cloudflare login link.
+7. Installs the Linux ops MCP (optional).
+8. Prints what to register in your control panel.
+
+Every step is skipped when it's already done, so the script is safe to run again. Leave out the public-network options
+for a NAT-only node, and `--agent-host` if you manage the tunnel yourself. `--yes` skips the bridge confirmation.
+
 ---
 
 ## Linux ops MCP
