@@ -70,7 +70,7 @@ PUBLIC_POOL = {x.strip() for x in os.environ.get("PUBLIC_POOL", "").split(",") i
 
 VM_ID = re.compile(r"^vm-[a-z0-9][a-z0-9-]{2,40}$")
 HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
-SSH_KEY = re.compile(r"^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+( [^\n]{0,200})?$")
+SSH_KEY = re.compile(r"^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/]{40,4096}={0,3}( [^\x00-\x1f\x7f]{0,200})?$")
 LIMITS = {"vcpu": (1, 16), "ram_mb": (512, 65536), "disk_gb": (10, 2000)}
 STATES = {0: "nostate", 1: "running", 2: "blocked", 3: "paused", 4: "shutting-down", 5: "stopped",
           6: "crashed", 7: "suspended"}
@@ -102,7 +102,7 @@ def _public_link_up() -> bool:
     return Path(f"/sys/class/net/{PUBLIC_BRIDGE}/bridge").exists()
 
 
-GA_SSH_SCRIPT = '#!/bin/sh\n# Let the host\'s node agent add/remove SSH keys through the QEMU guest agent.\n# RHEL/AlmaLinux 10 ship an allow-list of guest agent commands that leaves the SSH key commands out,\n# and SELinux needs virt_qemu_ga_manage_ssh to let the agent write ~/.ssh/authorized_keys.\nf=/etc/sysconfig/qemu-ga\nif [ -f "$f" ] && grep -q \'^FILTER_RPC_ARGS="--allow-rpcs=\' "$f" && ! grep -q \'guest-ssh-add-authorized-keys\' "$f"; then\n  sed -i \'s/^FILTER_RPC_ARGS="--allow-rpcs=/&guest-ssh-get-authorized-keys,guest-ssh-add-authorized-keys,guest-ssh-remove-authorized-keys,/\' "$f"\nfi\nif command -v setsebool >/dev/null 2>&1; then setsebool -P virt_qemu_ga_manage_ssh on 2>/dev/null || true; fi\nsystemctl restart qemu-guest-agent 2>/dev/null || true\n'
+GA_SSH_SCRIPT = '#!/bin/sh\n# Let the host\'s node agent add/remove SSH keys through the QEMU guest agent.\n# Some RHEL/AlmaLinux builds allow-list guest agent commands without the SSH key ones,\n# and SELinux needs virt_qemu_ga_read_ssh / virt_qemu_ga_manage_ssh for ~/.ssh/authorized_keys.\nfor f in /etc/sysconfig/qemu-ga /etc/sysconfig/qemu-guest-agent; do\n  if [ -f "$f" ] && grep -q \'^FILTER_RPC_ARGS="--allow-rpcs=\' "$f" && ! grep -q \'guest-ssh-add-authorized-keys\' "$f"; then\n    sed -i \'s/^FILTER_RPC_ARGS="--allow-rpcs=/&guest-ssh-get-authorized-keys,guest-ssh-add-authorized-keys,guest-ssh-remove-authorized-keys,/\' "$f"\n  fi\ndone\nif command -v setsebool >/dev/null 2>&1; then\n  setsebool -P virt_qemu_ga_read_ssh on 2>/dev/null || true\n  setsebool -P virt_qemu_ga_manage_ssh on 2>/dev/null || true\nfi\nsystemctl restart qemu-guest-agent 2>/dev/null || true\n'
 GA_SSH_WRITE_FILES = ("write_files:\n  - path: /usr/local/sbin/ga-ssh-keys.sh\n"
                       "    permissions: '0755'\n    content: |\n"
                       + "".join("      " + ln + "\n" for ln in GA_SSH_SCRIPT.rstrip("\n").split("\n")))
@@ -110,6 +110,19 @@ GA_SSH_WRITE_FILES = ("write_files:\n  - path: /usr/local/sbin/ga-ssh-keys.sh\n"
 SSH_KEY_RE = re.compile(
     r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
     r" [A-Za-z0-9+/]{40,4096}={0,3}( [^\x00-\x1f]{0,200})?$")
+
+
+def clean_removal_keys(keys) -> list[str]:
+    """Lines to remove: any single line already in authorized_keys (removing can't grant access)."""
+    if not isinstance(keys, list) or not 1 <= len(keys) <= 20:
+        raise AgentError(400, "keys must be a list of 1-20 key lines")
+    out = []
+    for k in keys:
+        k = str(k).strip()
+        if not k or len(k) > 16384 or any(c in k for c in "\n\r\x00"):
+            raise AgentError(400, "each key must be one line")
+        out.append(k)
+    return out
 
 
 def clean_ssh_keys(keys) -> list[str]:
@@ -338,7 +351,7 @@ class LibvirtBackend:
                     net_args = ["--network", f"bridge={PUBLIC_BRIDGE},model=virtio,mac={mac}"]
                 net_args += ["--network", f"network={INTERNAL_NET},model=virtio,mac={mac2}"]
             pw_hash = run(["openssl", "passwd", "-6", "-stdin"], stdin=password).strip()
-            keys = "\n".join(f"      - {k}" for k in spec.get("ssh_keys") or [])
+            keys = "\n".join("      - " + json.dumps(k) for k in spec.get("ssh_keys") or [])
             (seed / "user-data").write_text(
                 "#cloud-config\n"
                 f"hostname: \"{spec['hostname'].split('.')[0]}\"\n"
@@ -1178,8 +1191,9 @@ async def ssh_keys_get(request):
 async def ssh_keys_change(request):
     vm_id = vm_id_of(request)
     body = await request.json()
-    keys = clean_ssh_keys(body.get("keys"))
-    fn = backend.ssh_keys_remove if request.method == "DELETE" else backend.ssh_keys_add
+    removing = request.method == "DELETE"
+    keys = clean_removal_keys(body.get("keys")) if removing else clean_ssh_keys(body.get("keys"))
+    fn = backend.ssh_keys_remove if removing else backend.ssh_keys_add
     return await asyncio.to_thread(fn, vm_id, keys)
 
 
