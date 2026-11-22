@@ -102,6 +102,11 @@ def _public_link_up() -> bool:
     return Path(f"/sys/class/net/{PUBLIC_BRIDGE}/bridge").exists()
 
 
+GA_SSH_SCRIPT = '#!/bin/sh\n# Let the host\'s node agent add/remove SSH keys through the QEMU guest agent.\n# RHEL/AlmaLinux 10 ship an allow-list of guest agent commands that leaves the SSH key commands out,\n# and SELinux needs virt_qemu_ga_manage_ssh to let the agent write ~/.ssh/authorized_keys.\nf=/etc/sysconfig/qemu-ga\nif [ -f "$f" ] && grep -q \'^FILTER_RPC_ARGS="--allow-rpcs=\' "$f" && ! grep -q \'guest-ssh-add-authorized-keys\' "$f"; then\n  sed -i \'s/^FILTER_RPC_ARGS="--allow-rpcs=/&guest-ssh-get-authorized-keys,guest-ssh-add-authorized-keys,guest-ssh-remove-authorized-keys,/\' "$f"\nfi\nif command -v setsebool >/dev/null 2>&1; then setsebool -P virt_qemu_ga_manage_ssh on 2>/dev/null || true; fi\nsystemctl restart qemu-guest-agent 2>/dev/null || true\n'
+GA_SSH_WRITE_FILES = ("write_files:\n  - path: /usr/local/sbin/ga-ssh-keys.sh\n"
+                      "    permissions: '0755'\n    content: |\n"
+                      + "".join("      " + ln + "\n" for ln in GA_SSH_SCRIPT.rstrip("\n").split("\n")))
+
 SSH_KEY_RE = re.compile(
     r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)"
     r" [A-Za-z0-9+/]{40,4096}={0,3}( [^\x00-\x1f]{0,200})?$")
@@ -353,7 +358,9 @@ class LibvirtBackend:
                 + "ssh_pwauth: false\n"
                 "disable_root: true\n"
                 "growpart: {mode: auto, devices: ['/']}\n"
-                "runcmd:\n  - systemctl enable --now qemu-guest-agent\n")
+                + GA_SSH_WRITE_FILES
+                + "runcmd:\n  - systemctl enable --now qemu-guest-agent\n"
+                "  - [sh, /usr/local/sbin/ga-ssh-keys.sh]\n")
             # Our own NoCloud seed disk (volume label "cidata"), kept for the VM's lifetime.
             # (virt-install --cloud-init deletes its temporary ISO when it exits, which broke first boot.)
             files = [str(seed / f) for f in ("user-data", "meta-data", "network-config") if (seed / f).exists()]
@@ -405,9 +412,12 @@ class LibvirtBackend:
 
     def _ga_error(self, e) -> AgentError:
         msg = str(e)
-        if "not connected" in msg or "not responding" in msg or "agent" in msg.lower():
-            return AgentError(409, "the VM's guest agent isn't answering yet (still booting?). Try again in a minute")
-        return AgentError(500, msg)
+        low = msg.lower()
+        if "not connected" in low or "not responding" in low or "unable to connect" in low:
+            return AgentError(409, "the VM's guest agent isn't answering yet (still booting?). Try again in a minute. (" + msg + ")")
+        if "disabled" in low or "not allowed" in low or "not supported" in low or "unsupported" in low:
+            return AgentError(409, "the guest agent inside this VM doesn't allow SSH key commands (" + msg + ")")
+        return AgentError(502, "guest agent error: " + msg)
 
     def ssh_keys_get(self, vm_id: str) -> dict:
         d = self._guest_dom(vm_id)
