@@ -41,6 +41,16 @@ add_key PUBLIC_GATEWAY ""
 add_key PUBLIC_PREFIX 29
 add_key PUBLIC_DNS "1.1.1.1,8.8.8.8"
 add_key PUBLIC_POOL ""
+add_key BACKUP_DIR /home/vm-backups
+
+# backup storage: qemu writes live-backup targets here, so it needs the virt_image_t label and a traversable dir
+BDIR=$(grep ^BACKUP_DIR= /etc/kvm-node-agent/config.env | cut -d= -f2)
+install -d -m 0711 "$BDIR"
+if command -v getenforce >/dev/null && [[ $(getenforce) != Disabled ]]; then
+  rpm -q policycoreutils-python-utils >/dev/null || dnf install -y policycoreutils-python-utils
+  semanage fcontext -a -t virt_image_t "$BDIR(/.*)?" 2>/dev/null || semanage fcontext -m -t virt_image_t "$BDIR(/.*)?"
+  restorecon -R "$BDIR"
+fi
 
 install -m 0644 "$SRC/kvm-node-agent.service" /etc/systemd/system/kvm-node-agent.service
 systemctl daemon-reload

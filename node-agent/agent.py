@@ -15,6 +15,14 @@ Endpoints (JSON):
   DELETE /vms/{id}                     destroy + undefine + delete its disks
   WS     /vms/{id}/console             VNC (RFB) over WebSocket for noVNC
   WS     /events                       live stream: capacity + VM states every 3 s
+  POST   /vms  {"async": true, …}       create in the background -> job
+  GET    /jobs/{id}[?consume=1]         background job status/result (password handed out once)
+  GET    /backups                       backups on this node + backup storage space
+  POST   /vms/{id}/backups              start a backup (live if running) -> backup meta
+  GET    /backups/{bid}[/download]      metadata, or the qcow2 image (Range supported)
+  POST   /backups/{bid}/restore         overwrite the original VM's disk (VM is stopped, then started)
+  POST   /backups/{bid}/restore-new     new VM from the backup (same spec as POST /vms) -> job
+  DELETE /backups/{bid}
 
 Set AGENT_FAKE=1 to run without libvirt (in-memory fake VMs) for local testing.
 """
@@ -28,13 +36,15 @@ import os
 import re
 import secrets
 import shutil
+import hashlib
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
@@ -240,7 +250,8 @@ class LibvirtBackend:
         })
         return s
 
-    def create(self, spec: dict) -> dict:
+    def create(self, spec: dict, source: Path | None = None) -> dict:
+        """Create a VM from a template, or from an existing disk image (restore-as-new / relocation)."""
         self._ensure_conn()
         vm_id = spec["id"]
         try:
@@ -248,9 +259,14 @@ class LibvirtBackend:
             raise AgentError(409, f"{vm_id} already exists")
         except self.libvirt.libvirtError:
             pass
-        tpl = TEMPLATE_DIR / f"{spec['template']}.qcow2"
-        if not tpl.is_file():
-            raise AgentError(400, f"template {spec['template']} not found")
+        if source is not None:
+            tpl = source
+            vsize_gb = -(-json.loads(run(["qemu-img", "info", "--output=json", str(source)]))["virtual-size"] // 2**30)
+            spec["disk_gb"] = max(spec["disk_gb"], vsize_gb)       # never shrink a restored disk
+        else:
+            tpl = TEMPLATE_DIR / f"{spec['template']}.qcow2"
+            if not tpl.is_file():
+                raise AgentError(400, f"template {spec['template']} not found")
         free_mb = self.conn.getFreeMemory() // (1024 * 1024)
         if spec["ram_mb"] > free_mb - 2048:
             raise AgentError(507, f"not enough free RAM on {NODE_ID} ({free_mb} MB free)")
@@ -265,7 +281,7 @@ class LibvirtBackend:
         mac2 = None
         try:
             # Full copy (no backing chain) so backups/restores never depend on the template file
-            run(["qemu-img", "convert", "-O", "qcow2", str(tpl), str(disk)])
+            run(["qemu-img", "convert", "-O", "qcow2", str(tpl), str(disk)], timeout=7200)
             run(["qemu-img", "resize", str(disk), f"{spec['disk_gb']}G"])
             seed.mkdir(parents=True, exist_ok=True)
             net_args = ["--network", f"{NETWORK},model=virtio"]
@@ -402,11 +418,107 @@ class LibvirtBackend:
                 removed.append(str(p))
         return {"id": vm_id, "deleted": True, "removed_files": removed}
 
+    def _do_backup(self, vm_id: str, bid: str) -> dict:
+        import xml.etree.ElementTree as ET
+        lv = self.libvirt
+        conn = lv.open("qemu:///system")              # own connection for this thread
+        target = _bk_dir(bid) / "disk.qcow2"
+        try:
+            d = conn.lookupByName(vm_id)
+            (_bk_dir(bid) / "domain.xml").write_text(d.XMLDesc(lv.VIR_DOMAIN_XML_INACTIVE))
+            x = ET.fromstring(d.XMLDesc())
+            disks = x.findall("./devices/disk")
+            main = next(dk for dk in disks if dk.get("device") == "disk")
+            src = main.find("source").get("file")
+            if d.isActive():
+                parts = []
+                for dk in disks:
+                    dev = dk.find("target").get("dev")
+                    if dk is main:
+                        parts.append(f"<disk name='{dev}' backup='yes' type='file'><target file='{target}'/>"
+                                     f"<driver type='qcow2'/></disk>")
+                    else:
+                        parts.append(f"<disk name='{dev}' backup='no'/>")
+                frozen = False
+                try:
+                    d.fsFreeze()                     # consistent filesystems (guest agent); fine if it fails
+                    frozen = True
+                except lv.libvirtError:
+                    pass
+                try:
+                    d.backupBegin(f"<domainbackup mode='push'><disks>{''.join(parts)}</disks></domainbackup>", None, 0)
+                finally:
+                    if frozen:
+                        try:
+                            d.fsThaw()
+                        except lv.libvirtError:
+                            pass
+                while True:                           # wait for the push job, report progress
+                    time.sleep(2)
+                    try:
+                        st = d.jobStats()
+                    except lv.libvirtError:
+                        st = {}
+                    if not st or st.get("type", 0) == lv.VIR_DOMAIN_JOB_NONE:
+                        break
+                    total, done = st.get("disk_total") or st.get("data_total"), st.get("disk_processed") or st.get("data_processed")
+                    if total:
+                        m = read_meta(bid)
+                        m["progress"] = min(99, int(done * 100 / total))
+                        write_meta(bid, m)
+                try:
+                    st = d.jobStats(lv.VIR_DOMAIN_JOB_STATS_COMPLETED)
+                    if st.get("type") == lv.VIR_DOMAIN_JOB_FAILED:
+                        raise AgentError(500, st.get("errmsg") or "backup job failed")
+                except lv.libvirtError:
+                    pass
+                run(["qemu-img", "check", str(target)], timeout=3600)
+            else:
+                run(["qemu-img", "convert", "-O", "qcow2", src, str(target)], timeout=14400)
+            self._finish_backup(bid, target)
+            return {"backup_id": bid}
+        except Exception as e:
+            self._fail_backup(bid, e.message if isinstance(e, AgentError) else str(e))
+            raise
+        finally:
+            conn.close()
+
+    def _do_restore(self, vm_id: str, bid: str) -> dict:
+        import xml.etree.ElementTree as ET
+        lv = self.libvirt
+        conn = lv.open("qemu:///system")
+        try:
+            d = conn.lookupByName(vm_id)
+            src = (_bk_dir(bid) / read_meta(bid)["file"])
+            main = next(dk for dk in ET.fromstring(d.XMLDesc()).findall("./devices/disk") if dk.get("device") == "disk")
+            disk = Path(main.find("source").get("file"))
+            if d.isActive():                          # clean shutdown first, then force
+                try:
+                    d.shutdown()
+                except lv.libvirtError:
+                    pass
+                for _ in range(45):
+                    if not d.isActive():
+                        break
+                    time.sleep(2)
+                if d.isActive():
+                    d.destroy()
+            tmp = disk.with_suffix(".restore.tmp")
+            run(["qemu-img", "convert", "-O", "qcow2", str(src), str(tmp)], timeout=14400)
+            os.replace(tmp, disk)                     # atomic swap; the old disk is gone only now
+            d.create()
+            return {"vm_id": vm_id, "backup_id": bid}
+        finally:
+            conn.close()
+
     def vnc_port(self, vm_id: str) -> int:
         port = self.get(vm_id).get("vnc_port")
         if not port:
             raise AgentError(409, "VM has no active VNC console (is it running?)")
         return port
+
+
+FAKE_SLOW = os.environ.get("AGENT_FAKE_SLOW", "0") == "1"
 
 
 class FakeBackend:
@@ -436,20 +548,10 @@ class FakeBackend:
         if vm_id not in self.vms:
             raise AgentError(404, f"VM {vm_id} not found")
         v = dict(self.vms[vm_id])
-        v.update({"vcpu_max": 16, "disks": [{"dev": "vda", "size_gb": 30}],
+        v.update({"vcpu_max": 16, "disks": [{"dev": "vda", "size_gb": 30, "used_gb": 0.01}],
                   "ips": ["192.168.122.20"] if v["state"] == "running" else [], "vnc_port": None,
                   "autostart": True, "cpu_time_s": 1.0})
         return v
-
-    def create(self, spec):
-        if spec["id"] in self.vms:
-            raise AgentError(409, "exists")
-        self.vms[spec["id"]] = {"id": spec["id"], "uuid": "fake", "state": "running", "vcpu": spec["vcpu"], "public_ip": spec.get("public_ip"),
-                                "ram_mb": spec["ram_mb"], "managed": True}
-        out = self.get(spec["id"])
-        out.update({"login_user": DEFAULT_USER, "initial_password": "fake-password", "public_ip": spec.get("public_ip"),
-                    "internal_ip": "192.168.122.254" if spec.get("public_ip") else None})
-        return out
 
     def action(self, vm_id, action):
         v = self.get(vm_id)
@@ -465,8 +567,208 @@ class FakeBackend:
     def vnc_port(self, vm_id):
         raise AgentError(409, "no console in fake mode")
 
+    def _do_backup(self, vm_id, bid):
+        time.sleep(1.5)
+        target = _bk_dir(bid) / "disk.qcow2"
+        target.write_bytes(b"QFI\xfb" + os.urandom(4096))
+        self._finish_backup(bid, target)
+        return {"backup_id": bid}
 
-backend = FakeBackend() if FAKE else LibvirtBackend()
+    def _do_restore(self, vm_id, bid):
+        time.sleep(1.5)
+        self.vms[vm_id]["state"] = "running"
+        return {"vm_id": vm_id, "backup_id": bid}
+
+    def create(self, spec, source=None):
+        if spec["id"] in self.vms:
+            raise AgentError(409, "exists")
+        time.sleep(1.0 if FAKE_SLOW else 0)
+        self.vms[spec["id"]] = {"id": spec["id"], "uuid": "fake", "state": "running", "vcpu": spec["vcpu"],
+                                "public_ip": spec.get("public_ip"), "ram_mb": spec["ram_mb"], "managed": True}
+        out = self.get(spec["id"])
+        out.update({"login_user": DEFAULT_USER, "initial_password": "fake-password", "public_ip": spec.get("public_ip"),
+                    "internal_ip": "192.168.122.254" if spec.get("public_ip") else None})
+        return out
+
+
+# ------------------------------------------------------------------ backups and background jobs
+
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/home/vm-backups"))
+BK_ID = re.compile(r"^bk-[0-9]{14}-[0-9a-f]{6}$")
+JOBS: dict[str, dict] = {}            # in memory: restore / restore-as-new jobs (results read once)
+BUSY: set[str] = set()                # VMs with a backup/restore in progress
+change_lock = threading.Lock()        # libvirt define/undefine from background threads
+
+
+def _bk_dir(bid: str) -> Path:
+    if not BK_ID.match(bid):
+        raise AgentError(400, "bad backup id")
+    return BACKUP_DIR / bid
+
+
+def read_meta(bid: str) -> dict:
+    f = _bk_dir(bid) / "meta.json"
+    if not f.is_file():
+        raise AgentError(404, f"backup {bid} not found")
+    return json.loads(f.read_text())
+
+
+def write_meta(bid: str, meta: dict) -> None:
+    f = _bk_dir(bid) / "meta.json"
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(meta, indent=1))
+    os.replace(tmp, f)
+
+
+def list_backups() -> dict:
+    out = []
+    if BACKUP_DIR.is_dir():
+        for d in sorted(BACKUP_DIR.iterdir(), reverse=True):
+            if BK_ID.match(d.name) and (d / "meta.json").is_file():
+                try:
+                    m = json.loads((d / "meta.json").read_text())
+                    if m.get("status") == "running" and m.get("pid") != os.getpid():
+                        m.update(status="failed", error="agent restarted during backup")     # orphaned job
+                        write_meta(d.name, m)
+                    out.append({k: v for k, v in m.items() if k != "pid"})
+                except (OSError, ValueError):
+                    continue
+    try:
+        du = shutil.disk_usage(BACKUP_DIR)
+        space = {"total_gb": round(du.total / 2**30), "free_gb": round(du.free / 2**30)}
+    except OSError:
+        space = {"total_gb": None, "free_gb": None}
+    return {"node": NODE_ID, "dir": str(BACKUP_DIR), **space, "backups": out}
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 2**20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def new_job(kind: str, **info) -> dict:
+    jid = f"job-{secrets.token_hex(6)}"
+    JOBS[jid] = {"id": jid, "type": kind, "status": "running", "started": time.time(), **info}
+    return JOBS[jid]
+
+
+def run_job(job: dict, fn, *args) -> None:
+    def worker():
+        try:
+            res = fn(*args)
+            job.update(status="done", finished=time.time(), result=res or {})
+        except AgentError as e:
+            job.update(status="failed", finished=time.time(), error=e.message)
+        except Exception as e:  # noqa: BLE001
+            job.update(status="failed", finished=time.time(), error=f"{type(e).__name__}: {e}")
+        finally:
+            for k in ("vm_id", "new_vm_id"):
+                BUSY.discard(job.get(k))
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def mark_busy(vm_id: str) -> None:
+    if vm_id in BUSY:
+        raise AgentError(409, f"{vm_id} already has a backup or restore running")
+    BUSY.add(vm_id)
+
+
+class BackupMixin:
+    """Backups as plain qcow2 images (+ domain XML + meta.json + sha256), restorable on any node."""
+
+    def backup_start(self, vm_id: str, note: str = "") -> dict:
+        info = self.get(vm_id)
+        mark_busy(vm_id)
+        try:
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            used = sum(d.get("used_gb", d.get("size_gb", 0)) or 0 for d in info.get("disks", []))
+            if shutil.disk_usage(BACKUP_DIR).free / 2**30 < used * 1.1 + 5:
+                raise AgentError(507, f"not enough space in {BACKUP_DIR}")
+            bid = f"bk-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}-{secrets.token_hex(3)}"
+            d = _bk_dir(bid)
+            d.mkdir(mode=0o711)
+            os.chmod(d, 0o711)                     # qemu (svirt) writes the push-backup target in here
+            meta = {"id": bid, "vm_id": vm_id, "node": NODE_ID, "status": "running", "progress": 0,
+                    "kind": "live" if info["state"] == "running" else "offline", "note": note[:200],
+                    "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "pid": os.getpid(),
+                    "vm": {"vcpu": info.get("vcpu"), "ram_mb": info.get("ram_mb"),
+                           "disk_gb": max([x.get("size_gb") or 0 for x in info.get("disks", [])] or [0])},
+                    "file": "disk.qcow2"}
+            write_meta(bid, meta)
+        except Exception:
+            BUSY.discard(vm_id)
+            raise
+        job = new_job("backup", vm_id=vm_id, backup_id=bid)
+        run_job(job, self._do_backup, vm_id, bid)
+        return {k: v for k, v in meta.items() if k != "pid"}
+
+    def _finish_backup(self, bid: str, target: Path) -> None:
+        meta = read_meta(bid)
+        meta.update(status="ready", progress=100, size_bytes=target.stat().st_size, sha256=sha256_file(target),
+                    finished=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        write_meta(bid, meta)
+
+    def _fail_backup(self, bid: str, err: str) -> None:
+        try:
+            meta = read_meta(bid)
+            meta.update(status="failed", error=err[:500])
+            write_meta(bid, meta)
+            (_bk_dir(bid) / "disk.qcow2").unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def backup_delete(self, bid: str) -> dict:
+        meta = read_meta(bid)
+        if meta.get("status") == "running":
+            raise AgentError(409, "backup still running")
+        shutil.rmtree(_bk_dir(bid))
+        return {"id": bid, "deleted": True}
+
+    def backup_file(self, bid: str) -> tuple[Path, str]:
+        meta = read_meta(bid)
+        if meta.get("status") != "ready":
+            raise AgentError(409, "backup is not ready")
+        return _bk_dir(bid) / meta["file"], f"{meta['vm_id']}-{bid}.qcow2"
+
+    def restore_start(self, bid: str) -> dict:
+        meta = read_meta(bid)
+        if meta.get("status") != "ready":
+            raise AgentError(409, "backup is not ready")
+        self.get(meta["vm_id"])                  # must still exist here (else use restore-as-new)
+        mark_busy(meta["vm_id"])
+        job = new_job("restore", vm_id=meta["vm_id"], backup_id=bid)
+        run_job(job, self._do_restore, meta["vm_id"], bid)
+        return job
+
+    def restore_new_start(self, bid: str, spec: dict) -> dict:
+        meta = read_meta(bid)
+        if meta.get("status") != "ready":
+            raise AgentError(409, "backup is not ready")
+        mark_busy(spec["id"])
+        job = new_job("restore_new", backup_id=bid, new_vm_id=spec["id"], from_vm_id=meta["vm_id"])
+        src = _bk_dir(bid) / meta["file"]
+
+        def do():
+            with change_lock:
+                out = self.create(spec, source=src)
+            return {"id": spec["id"], "login_user": out.get("login_user"), "initial_password": out.get("initial_password"),
+                    "public_ip": out.get("public_ip"), "internal_ip": out.get("internal_ip"), "disk_gb": spec["disk_gb"]}
+        run_job(job, do)
+        return job
+
+
+class Libvirt(BackupMixin, LibvirtBackend):
+    pass
+
+
+class Fake(BackupMixin, FakeBackend):
+    pass
+
+
+backend = Fake() if FAKE else Libvirt()
 lock = asyncio.Lock()        # one libvirt change at a time on this host
 
 
@@ -563,9 +865,84 @@ def validate_spec(body: dict) -> dict:
 
 @endpoint
 async def create_vm(request):
-    spec = validate_spec(await request.json())
+    body = await request.json()
+    spec = validate_spec(body)
+    if body.get("async"):                      # background job: the caller polls GET /jobs/{id}
+        mark_busy(spec["id"])
+        job = new_job("create", new_vm_id=spec["id"])
+
+        def do():
+            with change_lock:
+                out = backend.create(spec)
+            return {k: out.get(k) for k in ("id", "login_user", "initial_password", "public_ip", "internal_ip")}
+        run_job(job, do)
+        return public_job(job)
     async with lock:
         return await asyncio.to_thread(backend.create, spec)
+
+
+def public_job(job: dict, consume: bool = False) -> dict:
+    out = {k: v for k, v in job.items() if k != "result"}
+    res = dict(job.get("result") or {})
+    if res:
+        out["result"] = res
+        if consume and "initial_password" in res:     # hand the password out once
+            job["result"].pop("initial_password", None)
+    return out
+
+
+@endpoint
+async def get_job(request):
+    jid = request.path_params["job_id"]
+    job = JOBS.get(jid)
+    if not job:
+        raise AgentError(404, "job not found (finished long ago, or the agent restarted)")
+    return public_job(job, consume=request.query_params.get("consume") == "1")
+
+
+@endpoint
+async def backups_list(request):
+    return await asyncio.to_thread(list_backups)
+
+
+@endpoint
+async def backup_create(request):
+    vm_id = vm_id_of(request)
+    body = await request.json() if (await request.body()) else {}
+    return await asyncio.to_thread(backend.backup_start, vm_id, str(body.get("note") or ""))
+
+
+@endpoint
+async def backup_delete(request):
+    return await asyncio.to_thread(backend.backup_delete, request.path_params["bid"])
+
+
+@endpoint
+async def backup_restore(request):
+    return public_job(await asyncio.to_thread(backend.restore_start, request.path_params["bid"]))
+
+
+@endpoint
+async def backup_restore_new(request):
+    body = await request.json()
+    body.setdefault("template", "backup")
+    spec = validate_spec(body)
+    return public_job(await asyncio.to_thread(backend.restore_new_start, request.path_params["bid"], spec))
+
+
+async def backup_download(request: Request):
+    if not authorised(request.headers):
+        return error(401, "unauthorised")
+    try:
+        path, name = await asyncio.to_thread(backend.backup_file, request.path_params["bid"])
+    except AgentError as e:
+        return error(e.status, e.message)
+    return FileResponse(path, filename=name, media_type="application/octet-stream")
+
+
+@endpoint
+async def backup_meta(request):
+    return await asyncio.to_thread(read_meta, request.path_params["bid"])
 
 
 async def vm_action(request: Request):
@@ -670,6 +1047,14 @@ app = Starlette(routes=[
     Route("/vms", create_vm, methods=["POST"]),
     Route("/vms/{vm_id}", get_vm, methods=["GET"]),
     Route("/vms/{vm_id}", delete_vm, methods=["DELETE"]),
+    Route("/jobs/{job_id}", get_job, methods=["GET"]),
+    Route("/backups", backups_list, methods=["GET"]),
+    Route("/backups/{bid}", backup_meta, methods=["GET"]),
+    Route("/backups/{bid}", backup_delete, methods=["DELETE"]),
+    Route("/backups/{bid}/download", backup_download, methods=["GET", "HEAD"]),
+    Route("/backups/{bid}/restore", backup_restore, methods=["POST"]),
+    Route("/backups/{bid}/restore-new", backup_restore_new, methods=["POST"]),
+    Route("/vms/{vm_id}/backups", backup_create, methods=["POST"]),
     Route("/vms/{vm_id}/{action}", vm_action, methods=["POST"]),
     WebSocketRoute("/vms/{vm_id}/console", console),
     WebSocketRoute("/events", events),
