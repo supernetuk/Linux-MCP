@@ -1,0 +1,682 @@
+"""
+KVM node agent — runs on each KVM host and does the actual VM work for the portal Worker.
+
+Listens on 127.0.0.1 only; reached through Cloudflare Tunnel (hostname protected by a Cloudflare
+Access service token) and every request must also carry `Authorization: Bearer <AGENT_TOKEN>`.
+
+Endpoints (JSON):
+  GET    /health                       versions, node id
+  GET    /capacity                     host CPU / RAM / disk / VM count
+  GET    /templates                    OS templates available
+  GET    /vms                          all VMs on this host
+  GET    /vms/{id}                     one VM in detail
+  POST   /vms                          create {id, hostname, template, vcpu, ram_mb, disk_gb, ssh_keys[]}
+  POST   /vms/{id}/start|shutdown|reboot|poweroff
+  DELETE /vms/{id}                     destroy + undefine + delete its disks
+  WS     /vms/{id}/console             VNC (RFB) over WebSocket for noVNC
+  WS     /events                       live stream: capacity + VM states every 3 s
+
+Set AGENT_FAKE=1 to run without libvirt (in-memory fake VMs) for local testing.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
+
+TOKEN = os.environ.get("AGENT_TOKEN", "")
+NODE_ID = os.environ.get("NODE_ID", "node-1")
+PORT = int(os.environ.get("AGENT_PORT", "8770"))
+IMAGE_DIR = Path(os.environ.get("IMAGE_DIR", "/var/lib/libvirt/images"))
+TEMPLATE_DIR = Path(os.environ.get("TEMPLATE_DIR", "/var/lib/libvirt/images/templates"))
+SEED_DIR = Path(os.environ.get("SEED_DIR", "/var/lib/kvm-node-agent/cloud-init"))
+NETWORK = os.environ.get("VM_NETWORK", "network=default")      # later: routed public network
+FAKE = os.environ.get("AGENT_FAKE", "0") == "1"
+DEFAULT_USER = os.environ.get("VM_DEFAULT_USER", "admin")
+# Public IPv4 for VMs: a host bridge on a spare NIC (no host IP on it) + static addresses from a fixed pool.
+# PUBLIC_BRIDGE: "br-vm" = a Linux bridge, or "direct:eth0" = macvtap on that NIC (no host network change;
+# VMs reach the router directly, but host <-> VM traffic over the network doesn't work). Empty = disabled.
+PUBLIC_BRIDGE = os.environ.get("PUBLIC_BRIDGE", "")
+PUBLIC_GATEWAY = os.environ.get("PUBLIC_GATEWAY", "")            # e.g. 203.0.113.1
+PUBLIC_PREFIX = int(os.environ.get("PUBLIC_PREFIX", "29"))
+PUBLIC_DNS = [x.strip() for x in os.environ.get("PUBLIC_DNS", "1.1.1.1,8.8.8.8").split(",") if x.strip()]
+INTERNAL_NET = os.environ.get("INTERNAL_NET", "default")          # libvirt network for internal IPs (GCP-style)
+INTERNAL_RANGE = (200, 254)                                        # static internal IPs for public VMs: .200-.254
+PUBLIC_POOL = {x.strip() for x in os.environ.get("PUBLIC_POOL", "").split(",") if x.strip()}   # allowed VM IPs
+
+VM_ID = re.compile(r"^vm-[a-z0-9][a-z0-9-]{2,40}$")
+HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+SSH_KEY = re.compile(r"^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+( [^\n]{0,200})?$")
+LIMITS = {"vcpu": (1, 16), "ram_mb": (512, 65536), "disk_gb": (10, 2000)}
+STATES = {0: "nostate", 1: "running", 2: "blocked", 3: "paused", 4: "shutting-down", 5: "stopped",
+          6: "crashed", 7: "suspended"}
+
+
+class AgentError(Exception):
+    def __init__(self, status: int, message: str):
+        self.status, self.message = status, message
+
+
+def run(argv: list[str], timeout: int = 600, stdin: str | None = None) -> str:
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=stdin)
+    if p.returncode != 0:
+        raise AgentError(500, f"{argv[0]} failed: {(p.stderr or p.stdout).strip()[-800:]}")
+    return p.stdout
+
+
+# ------------------------------------------------------------------ backends
+
+def _public_link_up() -> bool:
+    if not PUBLIC_BRIDGE:
+        return False
+    if PUBLIC_BRIDGE.startswith("direct:"):
+        nic = PUBLIC_BRIDGE.split(":", 1)[1]
+        try:
+            return Path(f"/sys/class/net/{nic}/operstate").read_text().strip() == "up"
+        except OSError:
+            return False
+    return Path(f"/sys/class/net/{PUBLIC_BRIDGE}/bridge").exists()
+
+
+class LibvirtBackend:
+    def __init__(self):
+        import libvirt  # system package python3-libvirt (venv uses --system-site-packages)
+        self.libvirt = libvirt
+        self.conn = libvirt.open("qemu:///system")
+
+    def _dom(self, vm_id: str):
+        try:
+            return self.conn.lookupByName(vm_id)
+        except self.libvirt.libvirtError:
+            raise AgentError(404, f"VM {vm_id} not found")
+
+    def _ensure_conn(self):
+        try:
+            self.conn.getLibVersion()
+        except Exception:
+            self.conn = self.libvirt.open("qemu:///system")
+
+    def health(self) -> dict:
+        self._ensure_conn()
+        v = self.conn.getLibVersion()
+        h = self.conn.getVersion()
+        fmt = lambda n: f"{n // 1000000}.{n // 1000 % 1000}.{n % 1000}"
+        return {"node": NODE_ID, "libvirt": fmt(v), "qemu": fmt(h), "fake": False,
+                "public_network": {"bridge": PUBLIC_BRIDGE or None, "gateway": PUBLIC_GATEWAY or None,
+                                   "prefix": PUBLIC_PREFIX, "pool": sorted(PUBLIC_POOL),
+                                   "bridge_up": _public_link_up()}}
+
+    def capacity(self) -> dict:
+        self._ensure_conn()
+        model, mem_mb, cpus, *_ = self.conn.getInfo()
+        free = self.conn.getFreeMemory() // (1024 * 1024)
+        du = shutil.disk_usage(IMAGE_DIR)
+        doms = self.conn.listAllDomains()
+        alloc_cpu = sum(d.info()[3] for d in doms if d.isActive())
+        alloc_mem = sum(d.info()[2] for d in doms if d.isActive()) // 1024
+        return {"node": NODE_ID, "cpus": cpus, "ram_mb": mem_mb, "ram_free_mb": free,
+                "disk_gb": round(du.total / 2**30), "disk_free_gb": round(du.free / 2**30),
+                "vms_total": len(doms), "vms_running": sum(1 for d in doms if d.isActive()),
+                "vcpu_allocated": alloc_cpu, "ram_allocated_mb": alloc_mem}
+
+    def templates(self) -> list[dict]:
+        out = []
+        for f in sorted(TEMPLATE_DIR.glob("*.qcow2")):
+            out.append({"id": f.stem, "file": f.name, "size_gb": round(f.stat().st_size / 2**30, 2)})
+        return out
+
+    # ---- internal IP (second NIC on the NAT network, static, no gateway, reserved in libvirt DHCP)
+    def _internal_net(self):
+        import xml.etree.ElementTree as ET
+        net = self.conn.networkLookupByName(INTERNAL_NET)
+        x = ET.fromstring(net.XMLDesc())
+        ip_el = x.find("ip")
+        base = ip_el.get("address").rsplit(".", 1)[0]
+        hosts = {h.get("ip"): h.get("mac") for h in ip_el.findall("./dhcp/host")}
+        return net, base, hosts
+
+    def _reserve_internal_ip(self, mac: str) -> str:
+        net, base, hosts = self._internal_net()
+        used = set(hosts)
+        try:
+            used |= {l["ipaddr"] for l in (net.DHCPLeases() or [])}
+        except self.libvirt.libvirtError:
+            pass
+        for n in range(INTERNAL_RANGE[1], INTERNAL_RANGE[0] - 1, -1):
+            ip = f"{base}.{n}"
+            if ip not in used:
+                lv = self.libvirt
+                net.update(lv.VIR_NETWORK_UPDATE_COMMAND_ADD_LAST, lv.VIR_NETWORK_SECTION_IP_DHCP_HOST, -1,
+                           f"<host mac='{mac}' ip='{ip}'/>",
+                           lv.VIR_NETWORK_UPDATE_AFFECT_LIVE | lv.VIR_NETWORK_UPDATE_AFFECT_CONFIG)
+                return ip
+        raise AgentError(507, "no free internal IP")
+
+    def _release_internal_ips(self, macs: list[str]) -> None:
+        try:
+            net, base, hosts = self._internal_net()
+        except Exception:
+            return
+        lv = self.libvirt
+        for ip, mac in hosts.items():
+            if mac and mac.lower() in {m.lower() for m in macs}:
+                try:
+                    net.update(lv.VIR_NETWORK_UPDATE_COMMAND_DELETE, lv.VIR_NETWORK_SECTION_IP_DHCP_HOST, -1,
+                               f"<host mac='{mac}' ip='{ip}'/>",
+                               lv.VIR_NETWORK_UPDATE_AFFECT_LIVE | lv.VIR_NETWORK_UPDATE_AFFECT_CONFIG)
+                except lv.libvirtError:
+                    pass
+
+    @staticmethod
+    def _seed_iso(vm_id: str) -> Path:
+        return IMAGE_DIR / "seed" / f"{vm_id}-seed.iso"
+
+    def _macs(self, d) -> list[str]:
+        import xml.etree.ElementTree as ET
+        return [m.get("address") for m in ET.fromstring(d.XMLDesc()).findall("./devices/interface/mac")]
+
+    def _summary(self, d) -> dict:
+        state, maxmem, mem, vcpus, cputime = d.info()
+        return {"id": d.name(), "uuid": d.UUIDString(), "state": STATES.get(state, str(state)),
+                "vcpu": vcpus, "ram_mb": mem // 1024, "managed": bool(VM_ID.match(d.name()))}
+
+    def list(self) -> list[dict]:
+        self._ensure_conn()
+        return [self._summary(d) for d in self.conn.listAllDomains()]
+
+    def get(self, vm_id: str) -> dict:
+        self._ensure_conn()
+        d = self._dom(vm_id)
+        s = self._summary(d)
+        import xml.etree.ElementTree as ET
+        x = ET.fromstring(d.XMLDesc())
+        disks = []
+        for disk in x.findall("./devices/disk[@device='disk']"):
+            src = disk.find("source")
+            tgt = disk.find("target")
+            if src is not None and tgt is not None:
+                try:
+                    cap, alloc, phys = d.blockInfo(tgt.get("dev"))
+                    disks.append({"dev": tgt.get("dev"), "file": src.get("file"),
+                                  "size_gb": round(cap / 2**30, 1), "used_gb": round(alloc / 2**30, 2)})
+                except self.libvirt.libvirtError:
+                    disks.append({"dev": tgt.get("dev"), "file": src.get("file")})
+        vcpu_el = x.find("vcpu")
+        g = x.find("./devices/graphics[@type='vnc']")
+        ips = []
+        if d.isActive():
+            for src in (self.libvirt.VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
+                        self.libvirt.VIR_DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE):
+                try:
+                    for name, iface in (d.interfaceAddresses(src) or {}).items():
+                        if name == "lo":
+                            continue
+                        for a in iface.get("addrs") or []:
+                            if not a["addr"].startswith("fe80"):
+                                ips.append(a["addr"])
+                    if ips:
+                        break
+                except self.libvirt.libvirtError:
+                    continue
+        s.update({
+            "vcpu_max": int(vcpu_el.text) if vcpu_el is not None else s["vcpu"],
+            "disks": disks, "ips": sorted(set(ips)),
+            "vnc_port": int(g.get("port")) if g is not None and g.get("port", "-1").isdigit() else None,
+            "autostart": bool(d.autostart()), "cpu_time_s": round(d.info()[4] / 1e9, 1),
+        })
+        return s
+
+    def create(self, spec: dict) -> dict:
+        self._ensure_conn()
+        vm_id = spec["id"]
+        try:
+            self.conn.lookupByName(vm_id)
+            raise AgentError(409, f"{vm_id} already exists")
+        except self.libvirt.libvirtError:
+            pass
+        tpl = TEMPLATE_DIR / f"{spec['template']}.qcow2"
+        if not tpl.is_file():
+            raise AgentError(400, f"template {spec['template']} not found")
+        free_mb = self.conn.getFreeMemory() // (1024 * 1024)
+        if spec["ram_mb"] > free_mb - 2048:
+            raise AgentError(507, f"not enough free RAM on {NODE_ID} ({free_mb} MB free)")
+        if shutil.disk_usage(IMAGE_DIR).free / 2**30 < spec["disk_gb"] * 0.2 + 5:
+            raise AgentError(507, f"not enough disk space on {NODE_ID}")
+
+        disk = IMAGE_DIR / f"{vm_id}.qcow2"
+        seed = SEED_DIR / vm_id
+        seed_iso = self._seed_iso(vm_id)
+        password = secrets.token_urlsafe(12)
+        internal_ip = None
+        mac2 = None
+        try:
+            # Full copy (no backing chain) so backups/restores never depend on the template file
+            run(["qemu-img", "convert", "-O", "qcow2", str(tpl), str(disk)])
+            run(["qemu-img", "resize", str(disk), f"{spec['disk_gb']}G"])
+            seed.mkdir(parents=True, exist_ok=True)
+            net_args = ["--network", f"{NETWORK},model=virtio"]
+            # meta-data: unique instance-id makes cloud-init treat this as a new instance
+            (seed / "meta-data").write_text(
+                f"instance-id: {vm_id}\nlocal-hostname: \"{spec['hostname'].split('.')[0]}\"\n")
+            if spec.get("public_ip"):
+                mac = "52:54:00:%02x:%02x:%02x" % tuple(secrets.token_bytes(3))
+                mac2 = "52:54:00:%02x:%02x:%02x" % tuple(secrets.token_bytes(3))
+                internal_ip = self._reserve_internal_ip(mac2)
+                dns = ", ".join(PUBLIC_DNS)
+                (seed / "network-config").write_text(
+                    "version: 2\n"
+                    "ethernets:\n"
+                    "  primary:\n"
+                    f"    match: {{macaddress: '{mac}'}}\n"
+                    "    set-name: eth0\n"
+                    f"    addresses: [{spec['public_ip']}/{PUBLIC_PREFIX}]\n"
+                    f"    routes: [{{to: 0.0.0.0/0, via: {PUBLIC_GATEWAY}}}]\n"
+                    f"    nameservers: {{addresses: [{dns}]}}\n"
+                    "  internal:\n"                       # GCP-style internal IP: no gateway, no DNS
+                    f"    match: {{macaddress: '{mac2}'}}\n"
+                    "    set-name: eth1\n"
+                    f"    addresses: [{internal_ip}/24]\n")
+                if PUBLIC_BRIDGE.startswith("direct:"):
+                    nic = PUBLIC_BRIDGE.split(":", 1)[1]
+                    net_args = ["--network", f"type=direct,source={nic},source.mode=bridge,model=virtio,mac={mac}"]
+                else:
+                    net_args = ["--network", f"bridge={PUBLIC_BRIDGE},model=virtio,mac={mac}"]
+                net_args += ["--network", f"network={INTERNAL_NET},model=virtio,mac={mac2}"]
+            pw_hash = run(["openssl", "passwd", "-6", "-stdin"], stdin=password).strip()
+            keys = "\n".join(f"      - {k}" for k in spec.get("ssh_keys") or [])
+            (seed / "user-data").write_text(
+                "#cloud-config\n"
+                f"hostname: \"{spec['hostname'].split('.')[0]}\"\n"
+                f"fqdn: \"{spec['hostname']}\"\n"
+                "users:\n"
+                f"  - name: {DEFAULT_USER}\n"
+                "    groups: [wheel]\n"
+                "    sudo: ALL=(ALL) ALL\n"
+                "    shell: /bin/bash\n"
+                "    lock_passwd: false\n"
+                f"    passwd: {pw_hash}\n"
+                + (f"    ssh_authorized_keys:\n{keys}\n" if keys else "")
+                + "ssh_pwauth: false\n"
+                "disable_root: true\n"
+                "growpart: {mode: auto, devices: ['/']}\n"
+                "runcmd:\n  - systemctl enable --now qemu-guest-agent\n")
+            # Our own NoCloud seed disk (volume label "cidata"), kept for the VM's lifetime.
+            # (virt-install --cloud-init deletes its temporary ISO when it exits, which broke first boot.)
+            files = [str(seed / f) for f in ("user-data", "meta-data", "network-config") if (seed / f).exists()]
+            seed_iso.parent.mkdir(parents=True, exist_ok=True)
+            run(["xorriso", "-as", "mkisofs", "-quiet", "-output", str(seed_iso), "-volid", "cidata",
+                 "-joliet", "-rock", *files])
+            os.chmod(seed_iso, 0o600)
+            vmax = max(spec["vcpu"], min(16, self.conn.getInfo()[2]))
+            maxmem = max(spec["ram_mb"] * 2, spec["ram_mb"] + 4096)
+            run(["virt-install", "--name", vm_id, "--osinfo", "linux2022",
+                 "--vcpus", f"{spec['vcpu']},maxvcpus={vmax}",
+                 "--cpu", f"host-passthrough,cell0.id=0,cell0.cpus=0-{vmax - 1},cell0.memory={spec['ram_mb'] * 1024}",
+                 "--memory", f"{spec['ram_mb']},maxMemory={maxmem},maxMemory.slots=4",
+                 "--disk", f"{disk},bus=virtio,format=qcow2",
+                 *net_args,
+                 "--boot", "uefi",
+                 "--channel", "unix,target.type=virtio,target.name=org.qemu.guest_agent.0",
+                 "--graphics", "vnc,listen=127.0.0.1",
+                 "--disk", f"path={seed_iso},device=cdrom,bus=sata,readonly=on",
+                 "--import", "--noautoconsole"], timeout=300)
+            self.conn.lookupByName(vm_id).setAutostart(1)
+        except Exception:
+            # clean up a half-created VM
+            try:
+                d = self.conn.lookupByName(vm_id)
+                if d.isActive():
+                    d.destroy()
+                d.undefineFlags(self.libvirt.VIR_DOMAIN_UNDEFINE_NVRAM)
+            except Exception:
+                pass
+            disk.unlink(missing_ok=True)
+            seed_iso.unlink(missing_ok=True)
+            if mac2:
+                self._release_internal_ips([mac2])
+            raise
+        finally:
+            shutil.rmtree(seed, ignore_errors=True)     # plain files removed; the hash lives only in the root-only seed ISO
+        out = self.get(vm_id)
+        out.update({"login_user": DEFAULT_USER, "initial_password": password,
+                    "public_ip": spec.get("public_ip"), "internal_ip": internal_ip})
+        return out
+
+    def action(self, vm_id: str, action: str) -> dict:
+        self._ensure_conn()
+        d = self._dom(vm_id)
+        try:
+            if action == "start":
+                if not d.isActive():
+                    d.create()
+            elif action == "shutdown":
+                if d.isActive():
+                    d.shutdown()
+            elif action == "reboot":
+                if not d.isActive():
+                    raise AgentError(409, "VM is not running")
+                d.reboot()
+            elif action == "poweroff":
+                if d.isActive():
+                    d.destroy()
+        except self.libvirt.libvirtError as e:
+            raise AgentError(500, str(e))
+        return self._summary(d)
+
+    def delete(self, vm_id: str) -> dict:
+        self._ensure_conn()
+        if not VM_ID.match(vm_id):
+            raise AgentError(400, "only portal-managed VMs (vm-…) can be deleted")
+        d = self._dom(vm_id)
+        files = [f["file"] for f in self.get(vm_id)["disks"] if f.get("file")]
+        macs = self._macs(d)
+        if d.isActive():
+            d.destroy()
+        lv = self.libvirt
+        d.undefineFlags(lv.VIR_DOMAIN_UNDEFINE_NVRAM | lv.VIR_DOMAIN_UNDEFINE_MANAGED_SAVE
+                        | lv.VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA | lv.VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA)
+        self._release_internal_ips(macs)
+        removed = []
+        iso = self._seed_iso(vm_id)
+        if iso.exists():
+            iso.unlink()
+            removed.append(str(iso))
+        for f in files:
+            p = Path(f).resolve()
+            if p.parent == IMAGE_DIR.resolve() and p.name.startswith(vm_id) and p.suffix == ".qcow2":
+                p.unlink(missing_ok=True)
+                removed.append(str(p))
+        return {"id": vm_id, "deleted": True, "removed_files": removed}
+
+    def vnc_port(self, vm_id: str) -> int:
+        port = self.get(vm_id).get("vnc_port")
+        if not port:
+            raise AgentError(409, "VM has no active VNC console (is it running?)")
+        return port
+
+
+class FakeBackend:
+    """In-memory backend for local tests (AGENT_FAKE=1)."""
+
+    def __init__(self):
+        self.vms: dict[str, dict] = {"vm-test1": {"id": "vm-test1", "uuid": "fake", "state": "running",
+                                                  "vcpu": 4, "ram_mb": 2048, "managed": True}}
+
+    def health(self):
+        return {"node": NODE_ID, "libvirt": "fake", "qemu": "fake", "fake": True}
+
+    def capacity(self):
+        return {"node": NODE_ID, "cpus": 32, "ram_mb": 63000, "ram_free_mb": 50000, "disk_gb": 70,
+                "disk_free_gb": 50, "vms_total": len(self.vms),
+                "vms_running": sum(v["state"] == "running" for v in self.vms.values()),
+                "vcpu_allocated": sum(v["vcpu"] for v in self.vms.values() if v["state"] == "running"),
+                "ram_allocated_mb": sum(v["ram_mb"] for v in self.vms.values() if v["state"] == "running")}
+
+    def templates(self):
+        return [{"id": "almalinux-10-cloud", "file": "almalinux-10-cloud.qcow2", "size_gb": 1.52}]
+
+    def list(self):
+        return list(self.vms.values())
+
+    def get(self, vm_id):
+        if vm_id not in self.vms:
+            raise AgentError(404, f"VM {vm_id} not found")
+        v = dict(self.vms[vm_id])
+        v.update({"vcpu_max": 16, "disks": [{"dev": "vda", "size_gb": 30}],
+                  "ips": ["192.168.122.20"] if v["state"] == "running" else [], "vnc_port": None,
+                  "autostart": True, "cpu_time_s": 1.0})
+        return v
+
+    def create(self, spec):
+        if spec["id"] in self.vms:
+            raise AgentError(409, "exists")
+        self.vms[spec["id"]] = {"id": spec["id"], "uuid": "fake", "state": "running", "vcpu": spec["vcpu"], "public_ip": spec.get("public_ip"),
+                                "ram_mb": spec["ram_mb"], "managed": True}
+        out = self.get(spec["id"])
+        out.update({"login_user": DEFAULT_USER, "initial_password": "fake-password", "public_ip": spec.get("public_ip"),
+                    "internal_ip": "192.168.122.254" if spec.get("public_ip") else None})
+        return out
+
+    def action(self, vm_id, action):
+        v = self.get(vm_id)
+        self.vms[vm_id]["state"] = {"start": "running", "shutdown": "stopped", "poweroff": "stopped",
+                                    "reboot": "running"}[action]
+        return self.vms[vm_id]
+
+    def delete(self, vm_id):
+        self.get(vm_id)
+        del self.vms[vm_id]
+        return {"id": vm_id, "deleted": True, "removed_files": []}
+
+    def vnc_port(self, vm_id):
+        raise AgentError(409, "no console in fake mode")
+
+
+backend = FakeBackend() if FAKE else LibvirtBackend()
+lock = asyncio.Lock()        # one libvirt change at a time on this host
+
+
+# ------------------------------------------------------------------ HTTP layer
+
+def authorised(headers) -> bool:
+    got = headers.get("authorization", "")
+    return bool(TOKEN) and hmac.compare_digest(got, f"Bearer {TOKEN}")
+
+
+def error(status: int, message: str) -> JSONResponse:
+    return JSONResponse({"error": message}, status_code=status)
+
+
+def endpoint(fn):
+    async def wrapper(request: Request):
+        if not authorised(request.headers):
+            return error(401, "unauthorised")
+        try:
+            return JSONResponse(await fn(request))
+        except AgentError as e:
+            return error(e.status, e.message)
+        except Exception as e:  # noqa: BLE001
+            return error(500, f"{type(e).__name__}: {e}")
+    return wrapper
+
+
+def vm_id_of(request: Request) -> str:
+    vm_id = request.path_params["vm_id"]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,60}", vm_id):
+        raise AgentError(400, "bad VM id")
+    return vm_id
+
+
+@endpoint
+async def health(request):
+    return await asyncio.to_thread(backend.health)
+
+
+@endpoint
+async def capacity(request):
+    return await asyncio.to_thread(backend.capacity)
+
+
+@endpoint
+async def templates(request):
+    return {"templates": await asyncio.to_thread(backend.templates)}
+
+
+@endpoint
+async def list_vms(request):
+    return {"vms": await asyncio.to_thread(backend.list)}
+
+
+@endpoint
+async def get_vm(request):
+    return await asyncio.to_thread(backend.get, vm_id_of(request))
+
+
+def validate_spec(body: dict) -> dict:
+    spec = {}
+    vm_id = str(body.get("id", ""))
+    if not VM_ID.match(vm_id):
+        raise AgentError(400, "id must look like vm-xxxxxxxx")
+    spec["id"] = vm_id
+    hostname = str(body.get("hostname") or vm_id).lower()
+    if not HOSTNAME.match(hostname) or len(hostname) > 253:
+        raise AgentError(400, "invalid hostname")
+    spec["hostname"] = hostname
+    spec["template"] = str(body.get("template", ""))
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", spec["template"]):
+        raise AgentError(400, "invalid template")
+    for k, (lo, hi) in LIMITS.items():
+        try:
+            v = int(body.get(k))
+        except (TypeError, ValueError):
+            raise AgentError(400, f"{k} required")
+        if not lo <= v <= hi:
+            raise AgentError(400, f"{k} must be {lo}–{hi}")
+        spec[k] = v
+    keys = body.get("ssh_keys") or []
+    if not isinstance(keys, list) or len(keys) > 10 or not all(isinstance(k, str) and SSH_KEY.match(k.strip()) for k in keys):
+        raise AgentError(400, "ssh_keys must be a list of public keys (ssh-ed25519 / ssh-rsa / ecdsa)")
+    spec["ssh_keys"] = [k.strip() for k in keys]
+    ip = str(body.get("public_ip") or "").strip()
+    if ip:
+        if not (PUBLIC_BRIDGE and PUBLIC_GATEWAY):
+            raise AgentError(400, "public IPs are not enabled on this node (PUBLIC_BRIDGE / PUBLIC_GATEWAY not set)")
+        if ip not in PUBLIC_POOL:
+            raise AgentError(400, f"{ip} is not in this node's public IP pool")
+        spec["public_ip"] = ip
+    return spec
+
+
+@endpoint
+async def create_vm(request):
+    spec = validate_spec(await request.json())
+    async with lock:
+        return await asyncio.to_thread(backend.create, spec)
+
+
+async def vm_action(request: Request):
+    if not authorised(request.headers):
+        return error(401, "unauthorised")
+    action = request.path_params["action"]
+    if action not in {"start", "shutdown", "reboot", "poweroff"}:
+        return error(404, "unknown action")
+    try:
+        vm_id = vm_id_of(request)
+        async with lock:
+            return JSONResponse(await asyncio.to_thread(backend.action, vm_id, action))
+    except AgentError as e:
+        return error(e.status, e.message)
+
+
+@endpoint
+async def delete_vm(request):
+    vm_id = vm_id_of(request)
+    async with lock:
+        return await asyncio.to_thread(backend.delete, vm_id)
+
+
+async def console(ws: WebSocket):
+    if not authorised(ws.headers):
+        await ws.close(code=4401)
+        return
+    try:
+        port = await asyncio.to_thread(backend.vnc_port, ws.path_params["vm_id"])
+    except AgentError as e:
+        await ws.accept()
+        await ws.close(code=4409, reason=e.message[:100])
+        return
+    sub = ws.headers.get("sec-websocket-protocol", "")
+    await ws.accept(subprotocol="binary" if "binary" in sub else None)
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+    async def ws_to_tcp():
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                data = msg.get("bytes") or (msg.get("text") or "").encode()
+                writer.write(data)
+                await writer.drain()
+        finally:
+            writer.close()
+
+    async def tcp_to_ws():
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                await ws.send_bytes(data)
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    try:
+        await asyncio.gather(ws_to_tcp(), tcp_to_ws())
+    except (WebSocketDisconnect, ConnectionError):
+        pass
+
+
+async def events(ws: WebSocket):
+    """Live stream for the portal: host capacity + VM states every few seconds."""
+    if not authorised(ws.headers):
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    interval = 3.0
+    try:
+        while True:
+            try:
+                cap, vms = await asyncio.gather(asyncio.to_thread(backend.capacity), asyncio.to_thread(backend.list))
+                await ws.send_text(json.dumps({"type": "snapshot", "ts": time.time(), "capacity": cap, "vms": vms}))
+            except AgentError as e:
+                await ws.send_text(json.dumps({"type": "error", "error": e.message}))
+            except (WebSocketDisconnect, RuntimeError):
+                raise
+            except Exception as e:  # noqa: BLE001
+                await ws.send_text(json.dumps({"type": "error", "error": f"{type(e).__name__}: {e}"}))
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=interval)
+                if msg["type"] == "websocket.disconnect":
+                    break
+            except asyncio.TimeoutError:
+                pass
+    except (WebSocketDisconnect, RuntimeError, ConnectionError):
+        pass
+
+
+app = Starlette(routes=[
+    Route("/health", health),
+    Route("/capacity", capacity),
+    Route("/templates", templates),
+    Route("/vms", list_vms, methods=["GET"]),
+    Route("/vms", create_vm, methods=["POST"]),
+    Route("/vms/{vm_id}", get_vm, methods=["GET"]),
+    Route("/vms/{vm_id}", delete_vm, methods=["DELETE"]),
+    Route("/vms/{vm_id}/{action}", vm_action, methods=["POST"]),
+    WebSocketRoute("/vms/{vm_id}/console", console),
+    WebSocketRoute("/events", events),
+])
+
+if __name__ == "__main__":
+    import uvicorn
+    if len(TOKEN) < 32:
+        raise SystemExit("AGENT_TOKEN must be at least 32 characters")
+    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning", timeout_graceful_shutdown=2)

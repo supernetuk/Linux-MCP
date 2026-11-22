@@ -1,0 +1,22 @@
+# /etc/sudoers.d/claude-ops  (install with: visudo -cf this-file && install -m 0440 ...)
+# Second layer behind the allowlist in ops_mcp.py: claude-ops may only sudo these binaries.
+# Note: dnf, systemctl and virsh with root are powerful — the allowlist in ops_mcp.py is what
+# limits their arguments, and admin mode must be switched on by a human first.
+Defaults:claude-ops !requiretty, logfile=/var/log/claude-ops/sudo.log
+
+Cmnd_Alias CLAUDE_READ  = /usr/bin/journalctl, /usr/bin/qemu-img info *, \
+                          /usr/bin/podman ps, /usr/bin/podman ps -a, /usr/bin/podman images, \
+                          /usr/bin/podman version, /usr/bin/firewall-cmd --list-all, \
+                          /usr/bin/firewall-cmd --state, /usr/bin/firewall-cmd --get-active-zones, \
+                          /usr/bin/firewall-cmd --list-all-zones
+Cmnd_Alias CLAUDE_ADMIN = /usr/bin/dnf, /usr/bin/systemctl, /usr/bin/virsh, /usr/bin/virt-install, \
+                          /usr/bin/virt-customize, /usr/bin/qemu-img, /usr/bin/mkdir, /usr/bin/curl, \
+                          /usr/bin/rm, /usr/bin/virt-host-validate, /usr/bin/cloud-localds
+
+Cmnd_Alias CLAUDE_AUDIT = /usr/local/sbin/claude-ops-audit logins, /usr/local/sbin/claude-ops-audit users, \
+                          /usr/local/sbin/claude-ops-audit ssh, /usr/local/sbin/claude-ops-audit persistence, \
+                          /usr/local/sbin/claude-ops-audit processes, /usr/local/sbin/claude-ops-audit network, \
+                          /usr/local/sbin/claude-ops-audit integrity, /usr/local/sbin/claude-ops-audit files, \
+                          /usr/local/sbin/claude-ops-audit all
+
+claude-ops ALL=(root) NOPASSWD: CLAUDE_READ, CLAUDE_ADMIN, CLAUDE_AUDIT

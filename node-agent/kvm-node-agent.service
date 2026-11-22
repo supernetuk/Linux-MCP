@@ -1,0 +1,16 @@
+[Unit]
+Description=KVM node agent (VM control API)
+After=network-online.target virtqemud.socket
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/kvm-node-agent/config.env
+WorkingDirectory=/opt/kvm-node-agent
+ExecStart=/opt/kvm-node-agent/venv/bin/python /opt/kvm-node-agent/agent.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

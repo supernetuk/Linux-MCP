@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Read-only security audit for the ops MCP server. Runs as root via sudo, takes ONE fixed section
+# name, and only reads. claude-ops may run this script with sudo; it cannot pass other commands.
+#   claude-ops-audit logins|users|ssh|persistence|processes|network|integrity|files|all
+set -uo pipefail
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+hr() { printf '\n===== %s =====\n' "$1"; }
+
+logins() {
+  hr "Successful SSH logins (last 30 days)"
+  journalctl -u sshd.service --since "-30 days" --no-pager -o short-iso -g 'Accepted ' 2>/dev/null | tail -n 60
+  hr "Cockpit logins (last 30 days)"
+  journalctl --since "-30 days" --no-pager -o short-iso -g 'cockpit.*(session opened|logged in)|pam_unix\(cockpit' 2>/dev/null | tail -n 30
+  hr "last (recent logins)"
+  last -a -n 30 2>/dev/null
+  hr "Failed SSH attempts (last 7 days) - total and top 15 source IPs"
+  journalctl -u sshd.service --since "-7 days" --no-pager -g 'Failed password|Invalid user' 2>/dev/null \
+    | grep -oE 'from [0-9a-f.:]+' | awk '{print $2}' | sort | uniq -c | sort -rn | awk 'NR==1{t=0}{t+=$1; a[NR]=$0} END{print "total:", t; for(i=1;i<=15&&i<=NR;i++) print a[i]}'
+  hr "fail2ban sshd jail"
+  fail2ban-client status sshd 2>/dev/null || echo "(no sshd jail)"
+}
+
+users() {
+  hr "Accounts with UID 0 or a login shell"
+  awk -F: '$3==0 || ($7 !~ /(nologin|false|sync|shutdown|halt)$/) {print $1, "uid="$3, "shell="$7, "home="$6}' /etc/passwd
+  hr "sudo / wheel members"
+  getent group wheel sudo 2>/dev/null
+  ls -la /etc/sudoers.d/ 2>/dev/null
+  hr "Accounts changed recently (passwd/shadow/group mtime)"
+  ls -la --time-style=long-iso /etc/passwd /etc/shadow /etc/group /etc/sudoers 2>/dev/null
+  hr "Password status"
+  for u in $(awk -F: '$7 !~ /(nologin|false)$/ {print $1}' /etc/passwd); do passwd -S "$u" 2>/dev/null; done
+}
+
+ssh() {
+  hr "Effective sshd settings"
+  sshd -T 2>/dev/null | grep -Ei '^(port|permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|maxauthtries|allowusers|allowgroups|authorizedkeysfile) '
+  hr "authorized_keys (fingerprints only)"
+  for d in /root $(awk -F: '$3>=1000 && $7 !~ /(nologin|false)$/ {print $6}' /etc/passwd); do
+    f="$d/.ssh/authorized_keys"
+    if [[ -f $f ]]; then echo "# $f ($(stat -c '%y' "$f" | cut -d. -f1))"; ssh-keygen -lf "$f" 2>/dev/null; fi
+  done
+}
+
+persistence() {
+  hr "User crontabs"
+  for u in $(cut -d: -f1 /etc/passwd); do c=$(crontab -l -u "$u" 2>/dev/null | grep -v '^\s*#' | grep -v '^\s*$'); [[ -n $c ]] && echo "# $u" && echo "$c"; done
+  hr "/etc/cron* (files changed in last 60 days)"
+  find /etc/cron* /var/spool/cron -type f -mtime -60 -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | sort
+  hr "at jobs"
+  atq 2>/dev/null
+  hr "systemd units in /etc changed in last 60 days"
+  find /etc/systemd/system /usr/lib/systemd/system /etc/systemd/user -name '*.service' -mtime -60 -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | sort
+  hr "systemd timers"
+  systemctl list-timers --all --no-pager 2>/dev/null | head -n 40
+  hr "rc.local / profile.d / ld.so.preload"
+  ls -la /etc/rc.d/rc.local /etc/ld.so.preload 2>/dev/null; cat /etc/ld.so.preload 2>/dev/null
+  find /etc/profile.d -type f -mtime -60 -printf '%TY-%Tm-%Td %p\n' 2>/dev/null
+}
+
+processes() {
+  hr "Top 25 processes by CPU"
+  ps -eo user,pid,ppid,pcpu,pmem,etime,args --sort=-pcpu | head -n 26 | cut -c1-200
+  hr "Processes running from /tmp, /var/tmp, /dev/shm or deleted binaries"
+  for p in /proc/[0-9]*; do
+    exe=$(readlink "$p/exe" 2>/dev/null) || continue
+    case "$exe" in /tmp/*|/var/tmp/*|/dev/shm/*|*" (deleted)") echo "${p#/proc/} $exe";; esac
+  done
+  hr "Known miner/backdoor process names"
+  ps -eo pid,user,args | grep -Ei 'xmrig|minerd|kdevtmpfsi|kinsing|cryptonight|stratum|\./\.[a-z]' | grep -v grep || echo "(none found)"
+}
+
+network() {
+  hr "Listening sockets with process"
+  ss -tulnp 2>/dev/null
+  hr "Established connections with process"
+  ss -tnp state established 2>/dev/null | head -n 80
+}
+
+integrity() {
+  hr "Changed package binaries (rpm -Va, excluding config/docs) — may take a few minutes"
+  rpm -Va --nomtime 2>/dev/null | grep -vE '^.{9}  [cdglr] ' | grep -E '^..5' | head -n 60 || echo "(no changed binaries)"
+}
+
+files() {
+  hr "Executable files in /tmp, /var/tmp, /dev/shm"
+  find /tmp /var/tmp /dev/shm -xdev -type f -perm /111 -printf '%TY-%Tm-%Td %u %p\n' 2>/dev/null | head -n 50
+  hr "Hidden files/dirs in /tmp, /var/tmp, /dev/shm"
+  find /tmp /var/tmp /dev/shm -xdev -name '.*' -printf '%TY-%Tm-%Td %u %p\n' 2>/dev/null | grep -vE '\.(X11|ICE|font|XIM|Test)-unix' | head -n 50
+  hr "SUID/SGID files changed in last 60 days"
+  find / -xdev \( -perm -4000 -o -perm -2000 \) -type f -mtime -60 -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | head -n 40
+  hr "Binaries in /usr/bin /usr/sbin changed in last 30 days (not from rpm updates if listed in integrity)"
+  find /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin -type f -mtime -30 -printf '%TY-%Tm-%Td %p\n' 2>/dev/null | sort | tail -n 40
+}
+
+case "${1:-}" in
+  logins|users|ssh|persistence|processes|network|integrity|files) "$1" ;;
+  all) logins; users; ssh; persistence; processes; network; files ;;
+  *) echo "usage: claude-ops-audit logins|users|ssh|persistence|processes|network|integrity|files|all" >&2; exit 2 ;;
+esac

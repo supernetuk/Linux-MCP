@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Switch the ops MCP server's admin mode on for a limited time, or off.
+#   sudo claude-ops-admin 2h      # on for 2 hours
+#   sudo claude-ops-admin 30m     # on for 30 minutes
+#   sudo claude-ops-admin off     # off now
+#   sudo claude-ops-admin status
+set -euo pipefail
+FLAG=/etc/claude-ops/admin-until
+
+if [[ $EUID -ne 0 ]]; then echo "run with sudo" >&2; exit 1; fi
+
+case "${1:-status}" in
+  off)
+    echo 0 > "$FLAG"; echo "admin mode OFF" ;;
+  status)
+    until=$(cat "$FLAG" 2>/dev/null || echo 0); now=$(date +%s)
+    if (( ${until%.*} > now )); then echo "admin mode ON until $(date -d @"${until%.*}")"
+    else echo "admin mode OFF"; fi ;;
+  *[0-9]m|*[0-9]h)
+    n=${1%?}; unit=${1: -1}
+    [[ $n =~ ^[0-9]+$ ]] || { echo "use e.g. 30m or 2h" >&2; exit 1; }
+    [[ $unit == h ]] && secs=$((n*3600)) || secs=$((n*60))
+    (( secs <= 8*3600 )) || { echo "maximum is 8h" >&2; exit 1; }
+    echo $(( $(date +%s) + secs )) > "$FLAG"
+    chmod 0644 "$FLAG"
+    echo "admin mode ON until $(date -d @"$(cat "$FLAG")")"
+    logger -t claude-ops "admin mode enabled for $1 by ${SUDO_USER:-root}" ;;
+  *)
+    echo "usage: claude-ops-admin 30m|2h|off|status" >&2; exit 1 ;;
+esac

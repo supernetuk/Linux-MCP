@@ -1,0 +1,24 @@
+[Unit]
+Description=Linux ops MCP server (Claude connector for this host)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=claude-ops
+Group=claude-ops
+EnvironmentFile=/etc/claude-ops/config.env
+WorkingDirectory=/opt/claude-ops
+ExecStart=/opt/claude-ops/venv/bin/python /opt/claude-ops/ops_mcp.py
+Restart=on-failure
+RestartSec=2
+# Open MCP event streams would otherwise hold a graceful stop for up to 90 s
+TimeoutStopSec=5
+KillMode=mixed
+# PrivateTmp is off: libguestfs/virt-install create temp files in /tmp that libvirt (uid qemu) must read
+PrivateTmp=no
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target
