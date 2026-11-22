@@ -326,6 +326,10 @@ class LibvirtBackend:
                 "    lock_passwd: false\n"
                 f"    passwd: {pw_hash}\n"
                 + (f"    ssh_authorized_keys:\n{keys}\n" if keys else "")
+                # chpasswd also sets the password when the user already exists (a VM started from a backup):
+                # the users: module above only sets passwd when it creates the user.
+                + "chpasswd:\n  expire: false\n  users:\n"
+                f"    - {{name: {DEFAULT_USER}, password: '{pw_hash}', type: hash}}\n"
                 + "ssh_pwauth: false\n"
                 "disable_root: true\n"
                 "growpart: {mode: auto, devices: ['/']}\n"
