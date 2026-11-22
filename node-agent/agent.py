@@ -428,9 +428,14 @@ class LibvirtBackend:
         low = msg.lower()
         if "not connected" in low or "not responding" in low or "unable to connect" in low:
             return AgentError(409, "the VM's guest agent isn't answering yet (still booting?). Try again in a minute. (" + msg + ")")
+        if "permission denied" in low:
+            return AgentError(409, "SELinux inside the VM blocks the guest agent from the SSH key file. Fix it once inside the VM "
+                                   "(web console): sudo setsebool -P virt_qemu_ga_read_ssh on; sudo setsebool -P virt_qemu_ga_manage_ssh on. "
+                                   "VMs created from now on have this set automatically.")
         if "disabled" in low or "not allowed" in low or "not supported" in low or "unsupported" in low:
             return AgentError(409, "the guest agent inside this VM doesn't allow SSH key commands (" + msg + ")")
-        return AgentError(502, "guest agent error: " + msg)
+        # 409, not 5xx: Cloudflare replaces 502/504 bodies with its own page, which would hide this message
+        return AgentError(409, "guest agent error: " + msg)
 
     def ssh_keys_get(self, vm_id: str) -> dict:
         d = self._guest_dom(vm_id)
