@@ -4,10 +4,13 @@
   claude-ops-asterisk show-conf <name.conf>          print a config with secrets masked
   claude-ops-asterisk list-backups [name.conf]       list backups made by install-conf
   claude-ops-asterisk log [lines]                    tail the Asterisk full/messages log
+  (readable: pjsip.conf extensions.conf rtp.conf musiconhold.conf;
+   installable: pjsip.conf extensions.conf musiconhold.conf)
   claude-ops-asterisk install-conf <workfile> <name.conf>
         copy a file from the MCP work dir over /etc/asterisk/<name.conf>, after backing up the
         current file. Lines like `password = __KEEP_SECRET__` keep the value that is already in
         the live file (same section, same key), so secrets never have to pass through Claude.
+        Files that use System/SHELL/AGI/Exec/FILE/MixMonitor/Lua or #include/#exec are refused.
   claude-ops-asterisk restore-conf <name.conf>       put back the newest backup
 
 Reloading Asterisk is a separate step (`asterisk -rx "pjsip reload"`).
@@ -15,6 +18,7 @@ Reloading Asterisk is a separate step (`asterisk -rx "pjsip reload"`).
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 
@@ -23,8 +27,20 @@ WORK = "/opt/claude-ops/work"
 BACKUP = "/var/lib/claude-ops/asterisk-backups"
 MASK = "__KEEP_SECRET__"
 SECRET_KEYS = {"password", "secret", "md5_cred", "md5secret", "auth_secret", "private_key",
-               "priv_key_file_password", "outbound_proxy_password"}
+               "priv_key_file_password", "outbound_proxy_password", "passwd", "api_key",
+               "apikey", "token", "auth_token", "access_token", "client_secret"}
 CONF_NAME = re.compile(r"^[a-z0-9_-]+\.conf$")
+# Only these files can be read or replaced. Control-plane files (asterisk.conf, modules.conf,
+# manager.conf, ari.conf, http.conf, extconfig.conf, logger.conf ...) are never touched.
+READABLE = {"pjsip.conf", "extensions.conf", "rtp.conf", "musiconhold.conf"}
+INSTALLABLE = {"pjsip.conf", "extensions.conf", "musiconhold.conf"}
+# Config content that could run OS commands, write files or pull in other files is refused.
+FORBIDDEN = re.compile(
+    r"(^\s*#\s*(exec|include|tryinclude)\b)"
+    r"|\b(System|TrySystem|SHELL|AGI|EAGI|DeadAGI|AsyncAGI|ExternalIVR|Exec|TryExec|ExecIf"
+    r"|MixMonitor|Monitor|FILE|Lua|JabberSend|ODBC_\w*)\s*\(",
+    re.IGNORECASE | re.MULTILINE)
+SECRET_INLINE = re.compile(r"(?i)(authorization:\s*\S+\s+|(password|secret|token)\s*[=:]\s*)\S+")
 WORK_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 KV = re.compile(r"^(\s*)([A-Za-z0-9_]+)(\s*=>?\s*)(.*)$")
 SECTION = re.compile(r"^\s*\[([^\]]+)\]")
@@ -36,9 +52,9 @@ def die(msg):
     sys.exit(1)
 
 
-def conf_path(name):
-    if not CONF_NAME.match(name):
-        die("config name must look like pjsip.conf")
+def conf_path(name, allowed=READABLE):
+    if not CONF_NAME.match(name) or name not in allowed:
+        die(f"config must be one of: {', '.join(sorted(allowed))}")
     return os.path.join(ETC, name)
 
 
@@ -48,6 +64,8 @@ def mask_lines(text):
         m = KV.match(line)
         if m and m.group(2).lower() in SECRET_KEYS and m.group(4).strip():
             line = f"{m.group(1)}{m.group(2)}{m.group(3)}{MASK}"
+        else:
+            line = SECRET_INLINE.sub(lambda x: x.group(1) + MASK, line)
         out.append(line)
     return "\n".join(out) + "\n"
 
@@ -108,16 +126,26 @@ def backup(path):
 
 
 def install_conf(workfile, name):
-    if not WORK_NAME.match(workfile):
+    if not WORK_NAME.match(workfile) or workfile in (".", ".."):
         die("work file must be a plain file name in the work dir")
+    path = conf_path(name, INSTALLABLE)
     src = os.path.join(WORK, workfile)
-    if os.path.islink(src) or not os.path.isfile(src):
-        die(f"{src} not found (write it with write_file first)")
-    if os.path.getsize(src) > MAX_SIZE:
-        die("file too large")
-    with open(src) as f:
+    # open first (no symlinks), then check what was actually opened: no check-then-open race
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        die(f"{src} not found or is a link (write it with write_file first)")
+    st_src = os.fstat(fd)
+    if not stat.S_ISREG(st_src.st_mode) or st_src.st_size > MAX_SIZE:
+        os.close(fd)
+        die("work file must be a regular file under 200 KB")
+    with os.fdopen(fd, "r", encoding="utf-8", errors="strict") as f:
         new = f.read()
-    path = conf_path(name)
+    bad = FORBIDDEN.search(new)
+    if bad:
+        line_no = new.count("\n", 0, bad.start()) + 1
+        die(f"refused: line {line_no} uses '{bad.group(0).strip()}' (commands, file access and "
+            "includes are not allowed in configs installed this way; edit on the server instead)")
     old = ""
     if os.path.isfile(path):
         with open(path) as f:
@@ -154,7 +182,7 @@ def install_conf(workfile, name):
 
 
 def restore_conf(name):
-    path = conf_path(name)
+    path = conf_path(name, INSTALLABLE)
     files = sorted(f for f in (os.listdir(BACKUP) if os.path.isdir(BACKUP) else [])
                    if f.startswith(name + "."))
     if not files:

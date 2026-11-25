@@ -76,7 +76,11 @@ If Asterisk is installed, the same connector can look after it:
 | Reload | `asterisk -rx "pjsip reload"`, `dialplan reload`, `core reload`, `module reload <mod>`, `pjsip qualify <aor>` | admin |
 | Test call | `asterisk -rx "channel originate PJSIP/<number>@<endpoint> application Playback hello-world"` (straight to a trunk) or `channel originate Local/<number>@<context> …` (through the dialplan, so its caller ID rules apply); either with `application Playback <sound>` or `extension <exten>@<context>` | admin |
 
-Shell-style CLI commands (`! …`), `core restart/stop`, `pjsip show auth(s)` and other originate forms are refused.
+Shell-style CLI commands (`! …`), `core restart/stop`, `module load`, `pjsip show auth(s)` and other originate forms are refused.
+Only `pjsip.conf`, `extensions.conf` and `musiconhold.conf` can be replaced (plus `rtp.conf` read-only); control-plane files
+(`asterisk.conf`, `modules.conf`, `manager.conf`, `ari.conf`, `http.conf` …) are never touched, and a config is refused if it
+uses `System`, `SHELL`, `AGI`, `Exec`, `FILE`, `MixMonitor`, `Lua`, or `#include`/`#exec`, so nothing installed this way can
+run OS commands or write files.
 Backups are kept in `/var/lib/claude-ops/asterisk-backups/`.
 
 ### Install

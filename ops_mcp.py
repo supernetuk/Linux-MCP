@@ -148,9 +148,10 @@ AST_READ = [  # Asterisk CLI commands (given to `asterisk -rx`) that only show t
 ]
 AST_ADMIN = [  # Asterisk CLI commands that change state (admin mode only)
     ["pjsip", "reload"], ["dialplan", "reload"], ["core", "reload"], ["logger", "reload"],
-    ["module", "reload", None], ["module", "load", None], ["pjsip", "qualify", None],
-    ["channel", "request", "hangup", None],
-]
+    ["pjsip", "qualify", None], ["channel", "request", "hangup", None],
+    ["module", "reload", "res_pjsip.so"], ["module", "reload", "pbx_config.so"],
+    ["module", "reload", "res_musiconhold.so"], ["module", "reload", "res_rtp_asterisk.so"],
+]  # no `module load`: loading new modules (AMI, ARI, app_system, func_shell ...) is never allowed
 AST_SOUND = re.compile(r"^[A-Za-z0-9_/-]+$")
 # PJSIP/<number>@<endpoint>  (straight to a trunk)  or  Local/<number>@<context>  (through the
 # dialplan, so caller ID and other dialplan rules apply)
@@ -184,7 +185,7 @@ def asterisk_cli(args: list[str], admin: bool) -> Plan:
             and AST_SOUND.match(words[5]):
         return Plan(["asterisk", "-rx", " ".join(words)], sudo=True)
     raise Refused("asterisk: allowed changes are pjsip/dialplan/core/logger reload, module "
-                  "reload/load <mod>, pjsip qualify <aor>, channel request hangup <chan|all>, and "
+                  "reload res_pjsip.so|pbx_config.so|res_musiconhold.so|res_rtp_asterisk.so, pjsip qualify <aor>, channel request hangup <chan|all>, and "
                   "channel originate PJSIP/<number>@<endpoint> or Local/<number>@<context> (application Playback <sound> | "
                   "extension <exten>@<context>)")
 
