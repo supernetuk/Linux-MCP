@@ -130,6 +130,73 @@ class Plan:
     sudo: bool
 
 
+# ---------------------------------------------------------------- Asterisk rules
+
+ASTERISK_HELPER = "/usr/local/sbin/claude-ops-asterisk"
+AST_READ = [  # Asterisk CLI commands (given to `asterisk -rx`) that only show things
+    ["core", "show", "version"], ["core", "show", "uptime"], ["core", "show", "settings"],
+    ["core", "show", "channels"], ["core", "show", "channels", "concise"],
+    ["core", "show", "channels", "verbose"], ["core", "show", "calls"],
+    ["core", "show", "channel", None], ["core", "show", "hints"],
+    ["pjsip", "show", "endpoints"], ["pjsip", "show", "endpoint", None],
+    ["pjsip", "show", "aors"], ["pjsip", "show", "aor", None], ["pjsip", "show", "contacts"],
+    ["pjsip", "show", "registrations"], ["pjsip", "show", "transports"],
+    ["pjsip", "show", "identifies"], ["pjsip", "show", "channels"],
+    ["pjsip", "show", "channelstats"], ["pjsip", "show", "version"],
+    ["dialplan", "show"], ["dialplan", "show", None],
+    ["module", "show"], ["module", "show", "like", None], ["rtp", "show", "settings"],
+]
+AST_ADMIN = [  # Asterisk CLI commands that change state (admin mode only)
+    ["pjsip", "reload"], ["dialplan", "reload"], ["core", "reload"], ["logger", "reload"],
+    ["module", "reload", None], ["module", "load", None], ["pjsip", "qualify", None],
+    ["channel", "request", "hangup", None],
+]
+AST_SOUND = re.compile(r"^[A-Za-z0-9_/-]+$")
+AST_DIAL = re.compile(r"^PJSIP/\+?[0-9]{3,16}@[A-Za-z0-9._-]+$")
+
+
+def _match(words: list[str], pattern: list) -> bool:
+    return len(words) == len(pattern) and all(
+        p == w if p is not None else bool(SAFE_NAME.match(w)) for p, w in zip(pattern, words))
+
+
+def asterisk_cli(args: list[str], admin: bool) -> Plan:
+    """`asterisk -rx "<cli command>"` — the CLI command is checked word by word."""
+    if len(args) != 2 or args[0] != "-rx":
+        raise Refused('asterisk: use  asterisk -rx "<cli command>"')
+    words = args[1].split()
+    if any(_match(words, p) for p in AST_READ):
+        return Plan(["asterisk", "-rx", " ".join(words)], sudo=True)
+    if not admin:
+        raise Refused("asterisk: read-only here is core/pjsip/dialplan/module show …; "
+                      "reloads and test calls need run_admin")
+    if any(_match(words, p) for p in AST_ADMIN):
+        return Plan(["asterisk", "-rx", " ".join(words)], sudo=True)
+    # test / campaign call:  channel originate PJSIP/<number>@<endpoint> application Playback <sound>
+    #                        channel originate PJSIP/<number>@<endpoint> extension <exten>@<context>
+    if words[:2] == ["channel", "originate"] and len(words) == 5 and AST_DIAL.match(words[2]) \
+            and words[3] == "extension" and re.fullmatch(r"[A-Za-z0-9_+-]+@[A-Za-z0-9_-]+", words[4]):
+        return Plan(["asterisk", "-rx", " ".join(words)], sudo=True)
+    if words[:2] == ["channel", "originate"] and len(words) == 6 and AST_DIAL.match(words[2]) \
+            and words[3] == "application" and words[4] in {"Playback", "Echo", "Wait"} \
+            and AST_SOUND.match(words[5]):
+        return Plan(["asterisk", "-rx", " ".join(words)], sudo=True)
+    raise Refused("asterisk: allowed changes are pjsip/dialplan/core/logger reload, module "
+                  "reload/load <mod>, pjsip qualify <aor>, channel request hangup <chan|all>, and "
+                  "channel originate PJSIP/<number>@<endpoint> (application Playback <sound> | "
+                  "extension <exten>@<context>)")
+
+
+def asterisk_helper(args: list[str], admin: bool) -> Plan:
+    sub = args[:1]
+    if sub in (["show-conf"], ["list-backups"], ["log"]) and len(args) <= 2:
+        return Plan([ASTERISK_HELPER, *args], sudo=True)
+    if admin and sub in (["install-conf"], ["restore-conf"]) and len(args) <= 3:
+        return Plan([ASTERISK_HELPER, *args], sudo=True)
+    raise Refused("claude-ops-asterisk: show-conf <x.conf> | list-backups | log [n] (read); "
+                  "install-conf <workfile> <x.conf> | restore-conf <x.conf> (admin mode)")
+
+
 # ---------------------------------------------------------------- read-only rules
 
 VIRSH_READ = {
@@ -240,6 +307,12 @@ def check_rule(argv: list[str]) -> Plan:
             return Plan(argv, sudo=False)
         raise Refused("ss: only -tln / -uln / -s")
 
+    if cmd == "asterisk":
+        return asterisk_cli(args, admin=False)
+
+    if cmd == "claude-ops-asterisk":
+        return asterisk_helper(args, admin=False)
+
     raise Refused(f"{cmd!r} is not on the read-only allowlist")
 
 
@@ -267,6 +340,12 @@ def admin_rule(argv: list[str]) -> Plan:
 
     if cmd != "virsh" and _is_read(argv):          # read-only commands also work via run_admin
         return check_rule(argv)
+
+    if cmd == "asterisk":
+        return asterisk_cli(args, admin=True)
+
+    if cmd == "claude-ops-asterisk":
+        return asterisk_helper(args, admin=True)
 
     if cmd in NETWORK_BLOCK:
         raise Refused(f"{cmd}: network changes are never run through this server — "
@@ -427,10 +506,13 @@ server = MCPServer(
     instructions=(
         "Tools for checking and setting up this KVM host. Use run_check for read-only "
         "commands. run_admin only works while the owner has switched admin mode on "
-        "(`sudo claude-ops-admin 2h` on the host); always give a reason. Commands run without a "
+        "(`sudo /usr/local/sbin/claude-ops-admin 2h` on the host); always give a reason. Commands run without a "
         "shell: one plain command per call, no pipes or redirects. Network changes and destroying "
         "non-test VMs are refused by design. Files for configs/XML go in /opt/claude-ops/work via "
-        "write_file."
+        "write_file. On Asterisk hosts: read configs with `claude-ops-asterisk show-conf pjsip.conf` "
+        "(secrets come back as __KEEP_SECRET__; leave that marker in place when editing), write the "
+        "edited file with write_file, then run_admin `claude-ops-asterisk install-conf <file> "
+        "pjsip.conf` and `asterisk -rx \"pjsip reload\"`."
     ),
 )
 
@@ -440,7 +522,7 @@ def host_status() -> str:
     """Show this server's mode: whether admin mode is on and until when, plus allowed areas."""
     until = admin_mode_until()
     state = (f"ON until {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(until))}"
-             if until > time.time() else "OFF (owner runs `sudo claude-ops-admin 2h` to enable)")
+             if until > time.time() else "OFF (owner runs `sudo /usr/local/sbin/claude-ops-admin 2h` to enable)")
     return "\n".join([
         f"admin mode: {state}",
         f"work dir (write_file/read_file): {WORK_DIR}",
@@ -452,6 +534,11 @@ def host_status() -> str:
         "admin commands: dnf install/update, systemctl (libvirt/cloudflared units), virsh "
         "(destroy/undefine only on vm-test*), virt-install, virt-customize (templates), qemu-img, "
         "mkdir -p, curl -o templates, rm (staging/work/vm-test* only), cloud-localds",
+        "asterisk (if installed): read: asterisk -rx \"pjsip show …|core show …|dialplan show …\", "
+        "claude-ops-asterisk show-conf <x.conf> (secrets masked) | list-backups | log [n]; "
+        "admin: asterisk -rx \"pjsip reload|dialplan reload|pjsip qualify <aor>|channel originate …\", "
+        "claude-ops-asterisk install-conf <workfile> <x.conf> (auto backup; write "
+        "`password = __KEEP_SECRET__` to keep the live secret) | restore-conf <x.conf>",
         "never: network changes, shells, deleting customer VMs",
     ])
 
@@ -480,7 +567,7 @@ def run_admin(command: str, reason: str) -> str:
     if not admin_on():
         audit({"tool": "run_admin", "command": command, "reason": reason, "result": "refused",
                "why": "admin mode off"})
-        return ("REFUSED: admin mode is OFF. Ask the owner to run `sudo claude-ops-admin 2h` "
+        return ("REFUSED: admin mode is OFF. Ask the owner to run `sudo /usr/local/sbin/claude-ops-admin 2h` "
                 "on the host, then retry.")
     try:
         plan = admin_rule(parse(command))

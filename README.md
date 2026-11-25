@@ -55,10 +55,29 @@ for a NAT-only node, and `--agent-host` if you manage the tunnel yourself. `--ye
   changes …) are always refused: do those from the server's out-of-band console.
 - Destructive `virsh` commands only work on VMs named `vm-test*`.
 - **Admin mode is off by default.** The owner turns it on for a limited time on the host:
-  `claude-ops-admin 2h` (max 8 h), `claude-ops-admin off`, `claude-ops-admin status`.
+  `sudo claude-ops-admin 2h` (max 8 h), `claude-ops-admin off`, `claude-ops-admin status`. On older installs where
+  sudo says "command not found", use the full path `sudo /usr/local/sbin/claude-ops-admin 2h` (re-running the
+  installer adds a link so the short form works).
 - Runs as an unprivileged `claude-ops` user. Root actions go through a sudoers file listing exact commands.
 - Every call is logged to `/var/log/claude-ops/audit.jsonl`, and sudo to `/var/log/claude-ops/sudo.log`.
 - The endpoint path contains a random 64-hex token (`/<token>/mcp`). Treat the full URL as a secret.
+
+### Asterisk hosts (optional)
+
+If Asterisk is installed, the same connector can look after it:
+
+| What | How | Mode |
+|---|---|---|
+| Status | `asterisk -rx "pjsip show contacts"`, `pjsip show endpoint(s)/aor(s)/registrations/transports`, `core show channels`, `dialplan show [ctx]`, `module show like x` | read |
+| Configs | `claude-ops-asterisk show-conf pjsip.conf`: passwords/secrets come back as `__KEEP_SECRET__` | read |
+| Logs | `claude-ops-asterisk log 300` | read |
+| Edit a config | `write_file` the edited file, then `claude-ops-asterisk install-conf <file> pjsip.conf`. The live file is backed up first; any `password = __KEEP_SECRET__` line keeps the existing value, so secrets never pass through the AI | admin |
+| Undo | `claude-ops-asterisk restore-conf pjsip.conf` | admin |
+| Reload | `asterisk -rx "pjsip reload"`, `dialplan reload`, `core reload`, `module reload <mod>`, `pjsip qualify <aor>` | admin |
+| Test call | `asterisk -rx "channel originate PJSIP/<number>@<endpoint> application Playback hello-world"` or `… extension <exten>@<context>` | admin |
+
+Shell-style CLI commands (`! …`), `core restart/stop`, `pjsip show auth(s)` and other originate forms are refused.
+Backups are kept in `/var/lib/claude-ops/asterisk-backups/`.
 
 ### Install
 

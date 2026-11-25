@@ -19,4 +19,8 @@ Cmnd_Alias CLAUDE_AUDIT = /usr/local/sbin/claude-ops-audit logins, /usr/local/sb
                           /usr/local/sbin/claude-ops-audit integrity, /usr/local/sbin/claude-ops-audit files, \
                           /usr/local/sbin/claude-ops-audit all
 
-claude-ops ALL=(root) NOPASSWD: CLAUDE_READ, CLAUDE_ADMIN, CLAUDE_AUDIT
+# Asterisk hosts: CLI via `asterisk -rx` (the CLI words are allowlisted in ops_mcp.py) and the
+# helper script with fixed subcommands. Harmless on hosts without Asterisk.
+Cmnd_Alias CLAUDE_ASTERISK = /usr/sbin/asterisk -rx *, /usr/local/sbin/claude-ops-asterisk *
+
+claude-ops ALL=(root) NOPASSWD: CLAUDE_READ, CLAUDE_ADMIN, CLAUDE_AUDIT, CLAUDE_ASTERISK
