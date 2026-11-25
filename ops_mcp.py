@@ -152,7 +152,9 @@ AST_ADMIN = [  # Asterisk CLI commands that change state (admin mode only)
     ["channel", "request", "hangup", None],
 ]
 AST_SOUND = re.compile(r"^[A-Za-z0-9_/-]+$")
-AST_DIAL = re.compile(r"^PJSIP/\+?[0-9]{3,16}@[A-Za-z0-9._-]+$")
+# PJSIP/<number>@<endpoint>  (straight to a trunk)  or  Local/<number>@<context>  (through the
+# dialplan, so caller ID and other dialplan rules apply)
+AST_DIAL = re.compile(r"^(PJSIP/\+?[0-9]{3,16}@[A-Za-z0-9._-]+|Local/\+?[0-9]{3,16}@[A-Za-z0-9_-]+)$")
 
 
 def _match(words: list[str], pattern: list) -> bool:
@@ -183,7 +185,7 @@ def asterisk_cli(args: list[str], admin: bool) -> Plan:
         return Plan(["asterisk", "-rx", " ".join(words)], sudo=True)
     raise Refused("asterisk: allowed changes are pjsip/dialplan/core/logger reload, module "
                   "reload/load <mod>, pjsip qualify <aor>, channel request hangup <chan|all>, and "
-                  "channel originate PJSIP/<number>@<endpoint> (application Playback <sound> | "
+                  "channel originate PJSIP/<number>@<endpoint> or Local/<number>@<context> (application Playback <sound> | "
                   "extension <exten>@<context>)")
 
 

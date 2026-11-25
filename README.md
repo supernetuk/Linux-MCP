@@ -74,7 +74,7 @@ If Asterisk is installed, the same connector can look after it:
 | Edit a config | `write_file` the edited file, then `claude-ops-asterisk install-conf <file> pjsip.conf`. The live file is backed up first; any `password = __KEEP_SECRET__` line keeps the existing value, so secrets never pass through the AI | admin |
 | Undo | `claude-ops-asterisk restore-conf pjsip.conf` | admin |
 | Reload | `asterisk -rx "pjsip reload"`, `dialplan reload`, `core reload`, `module reload <mod>`, `pjsip qualify <aor>` | admin |
-| Test call | `asterisk -rx "channel originate PJSIP/<number>@<endpoint> application Playback hello-world"` or `… extension <exten>@<context>` | admin |
+| Test call | `asterisk -rx "channel originate PJSIP/<number>@<endpoint> application Playback hello-world"` (straight to a trunk) or `channel originate Local/<number>@<context> …` (through the dialplan, so its caller ID rules apply); either with `application Playback <sound>` or `extension <exten>@<context>` | admin |
 
 Shell-style CLI commands (`! …`), `core restart/stop`, `pjsip show auth(s)` and other originate forms are refused.
 Backups are kept in `/var/lib/claude-ops/asterisk-backups/`.
